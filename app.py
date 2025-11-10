@@ -34,6 +34,8 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from run_registry import RunRegistry
+from session_state import SessionSnapshot, SessionStateStore
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -354,9 +356,13 @@ class FlowDataApp:
         self.schema_report: List[Dict[str, object]] = []
         self.quality_overview: Dict[str, object] = {}
         self.session_path = self.cache_dir / "session_state.json"
+        self.session_store = SessionStateStore(self.session_path)
+        self.session_snapshot: Optional[SessionSnapshot] = None
         self.session_dirty = False
+        self.session_status_var = tk.StringVar(value="No autosave available yet.")
+        self.session_dataset_var = tk.StringVar(value="")
         self.run_registry_path = self.cache_dir / "run_registry.json"
-        self.run_registry: List[Dict[str, object]] = []
+        self.run_registry_store = RunRegistry(self.run_registry_path)
         self._pending_training_restore: Optional[Dict[str, object]] = None
         self.quality_tree: Optional[ttk.Treeview] = None
         self.quality_summary_text: Optional[tk.Text] = None
@@ -385,6 +391,7 @@ class FlowDataApp:
         self.training_hint_var = tk.StringVar(
             value="Load files to populate feature options."
         )
+        self.random_seed_var = tk.IntVar(value=RANDOM_STATE)
 
         self.training_downsample_method_var = tk.StringVar(value="None")
         self.training_downsample_value_var = tk.StringVar(value="")
@@ -413,6 +420,9 @@ class FlowDataApp:
         self.cv_folds_var = tk.IntVar(value=5)
         self.n_jobs_var = tk.IntVar(value=default_jobs)
         self.training_status_var = tk.StringVar(value="Training not started.")
+        self.registry_edit_tags_var = tk.StringVar(value="")
+        self.registry_edit_notes_var = tk.StringVar(value="")
+        self.registry_edit_seed_var = tk.StringVar(value=str(RANDOM_STATE))
         # Model-specific hyperparameters
         self.lda_solver_var = tk.StringVar(value="svd")
         self.lda_shrinkage_var = tk.StringVar(value="")
@@ -453,6 +463,7 @@ class FlowDataApp:
         self.keep_rf_oob_var = tk.BooleanVar(value=True)
         self.training_model_description_var = tk.StringVar(value="")
         self.class_balance_var.trace_add("write", lambda *_: self._mark_session_dirty())
+        self.random_seed_var.trace_add("write", lambda *_: self._mark_session_dirty())
         self.training_model_configs = {
             "Random Forest": {
                 "key": "rf",
@@ -1323,6 +1334,7 @@ class FlowDataApp:
 
         run_meta_frame = ttk.Frame(training_frame)
         run_meta_frame.pack(fill="x", pady=(8, 0))
+        run_meta_frame.columnconfigure(1, weight=1)
         ttk.Label(run_meta_frame, text="Run tags (comma-separated)").grid(row=0, column=0, sticky="w")
         ttk.Entry(run_meta_frame, textvariable=self.run_tags_var, width=40).grid(
             row=1, column=0, sticky="w"
@@ -1331,6 +1343,15 @@ class FlowDataApp:
         ttk.Entry(run_meta_frame, textvariable=self.run_notes_var, width=50).grid(
             row=1, column=1, sticky="w", padx=(12, 0)
         )
+        ttk.Label(run_meta_frame, text="Random seed").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Spinbox(
+            run_meta_frame,
+            from_=-1_000_000_000,
+            to=1_000_000_000,
+            increment=1,
+            textvariable=self.random_seed_var,
+            width=14,
+        ).grid(row=1, column=2, sticky="w", padx=(12, 0))
 
         save_frame = ttk.LabelFrame(
             training_frame, text="Save Options", padding=8
@@ -2990,7 +3011,7 @@ class FlowDataApp:
             )
             return
 
-        rng = random.Random(RANDOM_STATE + int(time.time()))
+        rng = random.Random(self._random_state() + int(time.time()))
         for plot in self.cluster_explorer_plots:
             if len(features) >= 2:
                 x_feature, y_feature = rng.sample(features, 2)
@@ -3186,7 +3207,8 @@ class FlowDataApp:
 
         if len(df) > self.cluster_explorer_sample_limit:
             df = df.sample(
-                n=self.cluster_explorer_sample_limit, random_state=RANDOM_STATE
+                n=self.cluster_explorer_sample_limit,
+                random_state=self._random_state(),
             )
 
         ax.clear()
@@ -4347,6 +4369,33 @@ class FlowDataApp:
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
+        session_frame = ttk.LabelFrame(registry_tab, text="Session Recovery", padding=8)
+        session_frame.pack(fill="x", pady=(0, 12))
+        session_frame.columnconfigure(1, weight=1)
+        ttk.Label(
+            session_frame,
+            textvariable=self.session_status_var,
+            wraplength=640,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            session_frame,
+            textvariable=self.session_dataset_var,
+            wraplength=640,
+            justify="left",
+            foreground="#555555",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(
+            session_frame,
+            text="Restore Autosave",
+            command=self._restore_session_from_disk,
+        ).grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Button(
+            session_frame,
+            text="Save Snapshot Now",
+            command=self._save_session_now,
+        ).grid(row=1, column=2, sticky="e", padx=(12, 0))
+
         columns = ("timestamp", "model", "target", "accuracy", "tags")
         tree = ttk.Treeview(
             registry_tab,
@@ -4392,22 +4441,37 @@ class FlowDataApp:
             command=self._restore_selected_run,
         ).pack(side="left")
 
+        metadata_frame = ttk.LabelFrame(registry_tab, text="Edit Run Metadata", padding=8)
+        metadata_frame.pack(fill="x", pady=(12, 0))
+        metadata_frame.columnconfigure(1, weight=1)
+        ttk.Label(metadata_frame, text="Tags").grid(row=0, column=0, sticky="w")
+        ttk.Entry(metadata_frame, textvariable=self.registry_edit_tags_var, width=40).grid(
+            row=1, column=0, sticky="we"
+        )
+        ttk.Label(metadata_frame, text="Notes").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        ttk.Entry(metadata_frame, textvariable=self.registry_edit_notes_var).grid(
+            row=1, column=1, sticky="we", padx=(12, 0)
+        )
+        ttk.Label(metadata_frame, text="Seed").grid(row=0, column=2, sticky="w", padx=(12, 0))
+        ttk.Entry(metadata_frame, textvariable=self.registry_edit_seed_var, width=12).grid(
+            row=1, column=2, sticky="w", padx=(12, 0)
+        )
+        ttk.Button(
+            metadata_frame,
+            text="Save Changes",
+            command=self._update_selected_run_metadata,
+        ).grid(row=1, column=3, sticky="e", padx=(12, 0))
+
     def _load_run_registry(self) -> None:
         try:
-            if self.run_registry_path.exists():
-                with self.run_registry_path.open("r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-                self.run_registry = data.get("runs", [])
-            else:
-                self.run_registry = []
+            self.run_registry_store.load()
         except Exception:
-            self.run_registry = []
+            self.run_registry_store = RunRegistry(self.run_registry_path)
         self._update_run_registry_view()
 
     def _save_run_registry(self) -> None:
         try:
-            with self.run_registry_path.open("w", encoding="utf-8") as handle:
-                json.dump({"runs": self.run_registry}, handle, indent=2)
+            self.run_registry_store.save()
         except Exception:
             pass
 
@@ -4416,7 +4480,7 @@ class FlowDataApp:
             return
         tree = self.run_registry_tree
         tree.delete(*tree.get_children())
-        for record in sorted(self.run_registry, key=lambda item: item.get("timestamp", 0), reverse=True):
+        for record in self.run_registry_store.list_runs():
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.get("timestamp", 0)))
             accuracy = record.get("accuracy")
             accuracy_str = f"{accuracy:.3f}" if isinstance(accuracy, (int, float)) else "-"
@@ -4442,6 +4506,9 @@ class FlowDataApp:
         record = self._find_run_record(selection[0])
         if not record:
             return
+        self.registry_edit_tags_var.set(", ".join(record.get("tags", [])))
+        self.registry_edit_notes_var.set(record.get("notes", ""))
+        self.registry_edit_seed_var.set(str(record.get("seed", self._random_state())))
         lines = [
             f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(record.get('timestamp', 0)))}",
             f"Model: {record.get('model_name')}",
@@ -4451,6 +4518,7 @@ class FlowDataApp:
             f"Class balance: {record.get('class_balance', 'None')}",
             f"Tags: {', '.join(record.get('tags', [])) or '-'}",
             f"Notes: {record.get('notes') or '-'}",
+            f"Seed: {record.get('seed', '-')}",
             f"Features ({len(record.get('features', []))}): {', '.join(record.get('features', [])[:25])}" + ("…" if len(record.get('features', [])) > 25 else ""),
         ]
         self.run_detail_text.configure(state="normal")
@@ -4471,11 +4539,37 @@ class FlowDataApp:
             return
         self._restore_run_configuration(record)
 
+    def _update_selected_run_metadata(self) -> None:
+        if not self.run_registry_tree:
+            return
+        selection = self.run_registry_tree.selection()
+        if not selection:
+            messagebox.showinfo("Select run", "Select a run to edit its metadata.")
+            return
+        run_id = selection[0]
+        tags = self._parse_tags(self.registry_edit_tags_var.get())
+        notes = self.registry_edit_notes_var.get().strip()
+        seed_raw = self.registry_edit_seed_var.get().strip()
+        seed_value = self._random_state()
+        if seed_raw:
+            try:
+                seed_value = int(seed_raw)
+            except ValueError:
+                messagebox.showerror("Invalid seed", "Random seed must be an integer value.")
+                return
+        if not self.run_registry_store.update_metadata(run_id, tags=tags, notes=notes, seed=seed_value):
+            messagebox.showerror("Missing run", "Could not find the selected run in the registry.")
+            return
+        self.registry_edit_seed_var.set(str(seed_value))
+        self._update_run_registry_view()
+        self.run_registry_tree.selection_set(run_id)
+        self._on_run_registry_select()
+
     def _find_run_record(self, run_id: str) -> Optional[Dict[str, object]]:
-        for record in self.run_registry:
-            if record.get("id") == run_id:
-                return record
-        return None
+        record = self.run_registry_store.find(run_id)
+        if record is None:
+            return None
+        return dict(record)
 
     def _restore_run_configuration(self, record: Dict[str, object]) -> None:
         features = record.get("features", [])
@@ -4550,12 +4644,12 @@ class FlowDataApp:
             "class_balance": self.class_balance_var.get(),
             "tags": self._parse_tags(self.run_tags_var.get()),
             "notes": self.run_notes_var.get().strip(),
-            "seed": RANDOM_STATE,
+            "seed": self._random_state(),
         }
-        self.run_registry.append(record)
-        self._save_run_registry()
+        self.run_registry_store.add_run(record)
         self._update_run_registry_view()
         self.run_notes_var.set("")
+        self.run_tags_var.set("")
 
     @staticmethod
     def _parse_tags(raw: str) -> List[str]:
@@ -5618,7 +5712,7 @@ class FlowDataApp:
             max_cells = max(1000, int(self.clustering_umap_max_cells_var.get()))
             if len(assignment_df) > max_cells:
                 selected_df = assignment_df.sample(
-                    n=max_cells, random_state=RANDOM_STATE
+                    n=max_cells, random_state=self._random_state()
                 ).sort_index()
                 use_cache = False
 
@@ -5643,7 +5737,7 @@ class FlowDataApp:
                 n_neighbors=n_neighbors,
                 min_dist=min_dist,
                 metric=metric,
-                random_state=RANDOM_STATE,
+                random_state=self._random_state(),
                 n_components=2,
                 n_jobs=umap_jobs,
             )
@@ -6035,7 +6129,7 @@ class FlowDataApp:
                 n_clusters=n_clusters,
                 max_iter=max_iter,
                 n_init=n_init,
-                random_state=RANDOM_STATE,
+                random_state=self._random_state(),
             )
             labels = model.fit_predict(features_scaled)
             return labels
@@ -6064,7 +6158,7 @@ class FlowDataApp:
             graph = self._build_knn_graph(features_scaled, n_neighbors, n_jobs)
             G = nx.from_scipy_sparse_array(graph, edge_attribute="weight")
             partition = community_louvain.best_partition(
-                G, weight="weight", resolution=resolution, random_state=RANDOM_STATE
+                G, weight="weight", resolution=resolution, random_state=self._random_state()
             )
             labels = [partition[node] for node in range(features_scaled.shape[0])]
             return np.array(labels, dtype=int)
@@ -6083,7 +6177,7 @@ class FlowDataApp:
                 features_scaled.shape[1],
                 sigma=max(grid_x, grid_y) / 2.0,
                 learning_rate=0.5,
-                random_seed=RANDOM_STATE,
+                random_seed=self._random_state(),
             )
             som.train_random(features_scaled, iterations)
 
@@ -6092,7 +6186,7 @@ class FlowDataApp:
 
             codebook = som.get_weights().reshape(grid_x * grid_y, -1)
             kmeans_meta = KMeans(
-                n_clusters=meta_clusters, random_state=RANDOM_STATE, n_init=10
+                n_clusters=meta_clusters, random_state=self._random_state(), n_init=10
             )
             meta_labels = kmeans_meta.fit_predict(codebook)
             labels = meta_labels[bmu_indices]
@@ -6588,7 +6682,7 @@ class FlowDataApp:
                 return dataset, (
                     f"Target ({target_value}) meets/exceeds total rows; returning full dataset of {len(dataset)} rows."
                 )
-            sampled = dataset.sample(n=target_value, random_state=RANDOM_STATE)
+            sampled = dataset.sample(n=target_value, random_state=self._random_state())
             return (
                 sampled,
                 f"Total count downsampling: {len(sampled)} rows (target {target_value}).",
@@ -6602,7 +6696,7 @@ class FlowDataApp:
                     frames.append(group)
                 elif sample_size > 0:
                     frames.append(
-                        group.sample(n=sample_size, random_state=RANDOM_STATE)
+                        group.sample(n=sample_size, random_state=self._random_state())
                     )
             if not frames:
                 raise ValueError("No data available for downsampling.")
@@ -6627,7 +6721,7 @@ class FlowDataApp:
                     frames.append(group)
                 elif sample_size > 0:
                     frames.append(
-                        group.sample(n=sample_size, random_state=RANDOM_STATE)
+                        group.sample(n=sample_size, random_state=self._random_state())
                     )
 
             if not frames:
@@ -6654,7 +6748,7 @@ class FlowDataApp:
                     frames.append(group)
                 elif sample_size > 0:
                     frames.append(
-                        group.sample(n=sample_size, random_state=RANDOM_STATE)
+                        group.sample(n=sample_size, random_state=self._random_state())
                     )
 
             if not frames:
@@ -7249,7 +7343,7 @@ class FlowDataApp:
                     X,
                     y,
                     test_size=test_size,
-                    random_state=RANDOM_STATE,
+                    random_state=self._random_state(),
                     stratify=stratify,
                 )
             except ValueError:
@@ -7257,7 +7351,7 @@ class FlowDataApp:
                     X,
                     y,
                     test_size=test_size,
-                    random_state=RANDOM_STATE,
+                    random_state=self._random_state(),
                     stratify=None,
                 )
 
@@ -7431,7 +7525,7 @@ class FlowDataApp:
             max_features=params["max_features"],
             min_samples_leaf=params["min_samples_leaf"],
             n_jobs=n_jobs,
-            random_state=RANDOM_STATE,
+            random_state=self._random_state(),
             class_weight=class_weights,
         )
         fit_kwargs = {}
@@ -7447,7 +7541,7 @@ class FlowDataApp:
                 max_features=params["max_features"],
                 min_samples_leaf=params["min_samples_leaf"],
                 n_jobs=n_jobs,
-                random_state=RANDOM_STATE,
+                random_state=self._random_state(),
                 class_weight=class_weights,
             ),
             X_train,
@@ -7566,7 +7660,7 @@ class FlowDataApp:
             "max_iter": params["max_iter"],
             "class_weight": class_weights,
             "n_jobs": n_jobs,
-            "random_state": RANDOM_STATE,
+            "random_state": self._random_state(),
         }
         if params["penalty"] == "elasticnet":
             lr_kwargs["l1_ratio"] = params.get("l1_ratio", 0.5)
@@ -7651,7 +7745,7 @@ class FlowDataApp:
             objective=objective,
             eval_metric="mlogloss",
             n_jobs=n_jobs,
-            random_state=RANDOM_STATE,
+            random_state=self._random_state(),
             tree_method="hist",
         )
         model.fit(X_train_np, y_train, sample_weight=sample_weight)
@@ -7694,7 +7788,7 @@ class FlowDataApp:
             subsample=params["subsample"],
             class_weight=class_weights,
             n_jobs=n_jobs,
-            random_state=RANDOM_STATE,
+            random_state=self._random_state(),
         )
         model.fit(X_train_np, y_train, sample_weight=sample_weight)
         predictions = model.predict(X_test_np)
@@ -7735,7 +7829,7 @@ class FlowDataApp:
             n_clusters=params["n_clusters"],
             max_iter=params["max_iter"],
             n_init=params["n_init"],
-            random_state=RANDOM_STATE,
+            random_state=self._random_state(),
         )
         model.fit(X_train_scaled)
         train_clusters = model.predict(X_train_scaled)
@@ -8404,21 +8498,28 @@ class FlowDataApp:
         return str(value)
 
     def _load_session_state(self) -> None:
-        if not self.session_path.exists():
+        snapshot = self.session_store.load()
+        if not snapshot:
+            self._update_session_status(None)
             return
-        try:
-            with self.session_path.open("r", encoding="utf-8") as handle:
-                state = json.load(handle)
-        except Exception:
-            return
-        file_paths = [Path(p) for p in state.get("files", []) if Path(p).exists()]
+        self.session_snapshot = snapshot
+        self._update_session_status(snapshot)
+        self._apply_session_snapshot(snapshot)
+
+    def _apply_session_snapshot(self, snapshot: SessionSnapshot) -> None:
+        file_paths = [Path(path) for path in snapshot.files if Path(path).exists()]
+        if not file_paths and snapshot.datasets:
+            for dataset in snapshot.datasets:
+                path = dataset.get("path")
+                if path and Path(path).exists():
+                    file_paths.append(Path(path))
         if file_paths:
             self._loading_session = True
             try:
                 self.load_files_from_paths(file_paths)
             finally:
                 self._loading_session = False
-        training_state = state.get("training") or {}
+        training_state = snapshot.training or {}
         if training_state:
             self._pending_training_restore = training_state
             self.root.after(300, self._apply_training_restore)
@@ -8448,6 +8549,15 @@ class FlowDataApp:
         if model and model in self.training_model_configs:
             self.training_model_var.set(model)
             self._on_training_model_changed()
+            params = state.get("model_params")
+            if isinstance(params, dict):
+                self._apply_model_params(model, params)
+        seed = state.get("random_seed")
+        if seed is not None:
+            try:
+                self.random_seed_var.set(int(seed))
+            except (tk.TclError, ValueError):
+                self.random_seed_var.set(RANDOM_STATE)
         self._mark_session_dirty()
 
     def _mark_session_dirty(self) -> None:
@@ -8458,24 +8568,79 @@ class FlowDataApp:
         self.session_dirty = True
         self.root.after(800, self._flush_session_state)
 
-    def _flush_session_state(self) -> None:
-        if not self.session_dirty:
+    def _flush_session_state(self, force: bool = False) -> None:
+        if not force and not self.session_dirty:
             return
-        state = {
-            "files": [str(data_file.path) for data_file in self.data_files],
-            "training": {
-                "features": list(self.training_selection),
-                "target": self.target_column_var.get(),
-                "model": self.training_model_var.get(),
-                "class_balance": self.class_balance_var.get(),
-            },
+        datasets = [
+            {
+                "path": str(data_file.path),
+                "columns": list(data_file.columns),
+                "dtype_hints": dict(data_file.dtype_hints),
+            }
+            for data_file in self.data_files
+        ]
+        training_state = {
+            "features": list(self.training_selection),
+            "target": self.target_column_var.get(),
+            "model": self.training_model_var.get(),
+            "class_balance": self.class_balance_var.get(),
+            "random_seed": self._random_state(),
         }
+        model_name = training_state.get("model")
+        if model_name in self.training_model_configs:
+            try:
+                training_state["model_params"] = self._get_training_model_params(str(model_name))
+            except ValueError:
+                training_state["model_params"] = {}
+        snapshot = SessionSnapshot(
+            files=[str(data_file.path) for data_file in self.data_files],
+            datasets=datasets,
+            training=training_state,
+        )
         try:
-            with self.session_path.open("w", encoding="utf-8") as handle:
-                json.dump(state, handle, indent=2)
+            self.session_store.save(snapshot)
+            self.session_snapshot = snapshot
+            self._update_session_status(snapshot)
         except Exception:
             pass
         self.session_dirty = False
+
+    def _save_session_now(self) -> None:
+        self.session_dirty = True
+        self._flush_session_state(force=True)
+
+    def _restore_session_from_disk(self) -> None:
+        snapshot = self.session_store.load()
+        if not snapshot:
+            messagebox.showinfo("No autosave", "No autosave snapshot is available yet.")
+            return
+        self.session_snapshot = snapshot
+        self._update_session_status(snapshot)
+        self._apply_session_snapshot(snapshot)
+
+    def _update_session_status(self, snapshot: Optional[SessionSnapshot]) -> None:
+        if not snapshot:
+            self.session_status_var.set("No autosave available yet.")
+            self.session_dataset_var.set("")
+            return
+        timestamp = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(snapshot.saved_at)
+        )
+        self.session_status_var.set(f"Autosave from {timestamp}")
+        if snapshot.files:
+            names = [Path(path).name for path in snapshot.files]
+            preview = ", ".join(names[:5])
+            if len(names) > 5:
+                preview += f" …(+{len(names) - 5})"
+            self.session_dataset_var.set(f"Datasets: {preview}")
+        else:
+            self.session_dataset_var.set("No datasets captured in autosave.")
+
+    def _random_state(self) -> int:
+        try:
+            return int(self.random_seed_var.get())
+        except (tk.TclError, ValueError):
+            return RANDOM_STATE
 
     def _recompute_column_numeric_hints(self) -> None:
         hints: Dict[str, bool] = {}
