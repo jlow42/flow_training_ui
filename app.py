@@ -35,7 +35,8 @@ from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineConfig, DataEngineError
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, SpectralClustering, AgglomerativeClustering
+from sklearn.mixture import GaussianMixture
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
@@ -46,6 +47,8 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     adjusted_rand_score,
+    silhouette_score,
+    normalized_mutual_info_score,
 )
 from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.neighbors import NearestNeighbors
@@ -90,6 +93,11 @@ try:
     import umap  # type: ignore[import]
 except ImportError:
     umap = None  # type: ignore[assignment]
+
+try:
+    import hdbscan  # type: ignore[import]
+except ImportError:
+    hdbscan = None  # type: ignore[assignment]
 
 try:
     import torch  # type: ignore[import]
@@ -537,6 +545,159 @@ class FlowDataApp:
                     },
                 },
             },
+            "gmm": {
+                "label": "Gaussian Mixture",
+                "selected": tk.BooleanVar(value=False),
+                "params": {
+                    "n_components": {
+                        "label": "Components",
+                        "var": tk.StringVar(value="10"),
+                        "type": "int",
+                        "from": 1,
+                        "to": 200,
+                        "increment": 1,
+                        "token": "comp{}",
+                        "display_token": "components={}",
+                    },
+                    "covariance_type": {
+                        "label": "Covariance type",
+                        "var": tk.StringVar(value="full"),
+                        "type": "str",
+                        "token": "cov{}",
+                        "display_token": "cov={}",
+                    },
+                    "reg_covar": {
+                        "label": "Reg covar",
+                        "var": tk.StringVar(value="0.0001"),
+                        "type": "float",
+                        "from": 0.0,
+                        "to": 1.0,
+                        "increment": 0.0001,
+                        "token": "reg{}",
+                        "display_token": "reg={}",
+                    },
+                    "n_init": {
+                        "label": "Initializations",
+                        "var": tk.StringVar(value="5"),
+                        "type": "int",
+                        "from": 1,
+                        "to": 50,
+                        "increment": 1,
+                        "display_token": "n_init={}",
+                    },
+                },
+            },
+            "spectral": {
+                "label": "Spectral",
+                "selected": tk.BooleanVar(value=False),
+                "params": {
+                    "n_clusters": {
+                        "label": "Clusters (k)",
+                        "var": tk.StringVar(value="10"),
+                        "type": "int",
+                        "from": 2,
+                        "to": 200,
+                        "increment": 1,
+                        "token": "k{}",
+                        "display_token": "k={}",
+                    },
+                    "assign_labels": {
+                        "label": "Assign labels",
+                        "var": tk.StringVar(value="kmeans"),
+                        "type": "str",
+                        "token": "assign{}",
+                        "display_token": "assign={}",
+                    },
+                    "affinity": {
+                        "label": "Affinity",
+                        "var": tk.StringVar(value="rbf"),
+                        "type": "str",
+                        "token": "aff{}",
+                        "display_token": "aff={}",
+                    },
+                    "gamma": {
+                        "label": "Gamma",
+                        "var": tk.StringVar(value="1.0"),
+                        "type": "float",
+                        "from": 0.0,
+                        "to": 10.0,
+                        "increment": 0.1,
+                        "display_token": "gamma={}",
+                    },
+                    "n_neighbors": {
+                        "label": "Neighbors",
+                        "var": tk.StringVar(value="10"),
+                        "type": "int",
+                        "from": 2,
+                        "to": 200,
+                        "increment": 1,
+                        "display_token": "nn={}",
+                    },
+                },
+            },
+            "agglomerative": {
+                "label": "Agglomerative",
+                "selected": tk.BooleanVar(value=False),
+                "params": {
+                    "n_clusters": {
+                        "label": "Clusters (k)",
+                        "var": tk.StringVar(value="10"),
+                        "type": "int",
+                        "from": 2,
+                        "to": 200,
+                        "increment": 1,
+                        "token": "k{}",
+                        "display_token": "k={}",
+                    },
+                    "linkage": {
+                        "label": "Linkage",
+                        "var": tk.StringVar(value="ward"),
+                        "type": "str",
+                        "token": "link{}",
+                        "display_token": "link={}",
+                    },
+                    "metric": {
+                        "label": "Metric",
+                        "var": tk.StringVar(value="euclidean"),
+                        "type": "str",
+                        "token": "metric{}",
+                        "display_token": "metric={}",
+                    },
+                },
+            },
+            "hdbscan": {
+                "label": "HDBSCAN",
+                "selected": tk.BooleanVar(value=False),
+                "params": {
+                    "min_cluster_size": {
+                        "label": "Min cluster size",
+                        "var": tk.StringVar(value="30"),
+                        "type": "int",
+                        "from": 2,
+                        "to": 1000,
+                        "increment": 1,
+                        "token": "mcs{}",
+                        "display_token": "min_size={}",
+                    },
+                    "min_samples": {
+                        "label": "Min samples",
+                        "var": tk.StringVar(value="10"),
+                        "type": "int",
+                        "from": 1,
+                        "to": 1000,
+                        "increment": 1,
+                        "token": "ms{}",
+                        "display_token": "min_samples={}",
+                    },
+                    "cluster_selection_method": {
+                        "label": "Selection method",
+                        "var": tk.StringVar(value="eom"),
+                        "type": "str",
+                        "token": "sel{}",
+                        "display_token": "selection={}",
+                    },
+                },
+            },
             "leiden": {
                 "label": "Leiden",
                 "selected": tk.BooleanVar(value=False),
@@ -732,6 +893,14 @@ class FlowDataApp:
         self.clustering_heatmap_marker_dendro_var = tk.BooleanVar(value=False)
         self.clustering_metadata: Dict[str, Dict[str, object]] = {}
         self.clustering_run_metadata_base: Dict[str, object] = {}
+        self.clustering_metrics_records: List[Dict[str, object]] = []
+        self.clustering_metric_choice_var = tk.StringVar(value="Silhouette")
+        self.clustering_metric_best_var = tk.StringVar(
+            value="Run clustering to compute stability metrics."
+        )
+        self.clustering_metrics_fig: Optional[Figure] = None
+        self.clustering_metrics_ax: Optional[Axes] = None
+        self.clustering_metrics_canvas: Optional[FigureCanvasTkAgg] = None
         self.cluster_explorer_method_var = tk.StringVar()
         self.cluster_explorer_plots: List[Dict[str, Any]] = []
         self.cluster_explorer_feature_options: List[str] = []
@@ -2132,6 +2301,17 @@ class FlowDataApp:
         )
         methods_frame.pack(fill="both", expand=True, pady=(12, 0))
 
+        ttk.Label(
+            methods_frame,
+            text=(
+                "Enter comma- or space-separated values to sweep hyperparameters. "
+                "Each combination is evaluated with silhouette, ARI, and NMI metrics."
+            ),
+            foreground="#444444",
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
         self.clustering_method_param_widgets = {}
         for method_key, method_config in self.clustering_methods.items():
             method_panel = ttk.Frame(methods_frame)
@@ -2213,17 +2393,65 @@ class FlowDataApp:
 
         self.clustering_summary_tree = ttk.Treeview(
             summary_frame,
-            columns=("method", "clusters", "rows"),
+            columns=("method", "clusters", "rows", "silhouette", "ari", "nmi"),
             show="headings",
             height=6,
         )
         self.clustering_summary_tree.heading("method", text="Method")
         self.clustering_summary_tree.heading("clusters", text="Clusters")
         self.clustering_summary_tree.heading("rows", text="Rows used")
+        self.clustering_summary_tree.heading("silhouette", text="Silhouette")
+        self.clustering_summary_tree.heading("ari", text="ARI")
+        self.clustering_summary_tree.heading("nmi", text="NMI")
         self.clustering_summary_tree.column("method", anchor="w", width=220)
-        self.clustering_summary_tree.column("clusters", anchor="center", width=100)
-        self.clustering_summary_tree.column("rows", anchor="center", width=100)
-        self.clustering_summary_tree.pack(fill="x", pady=(4, 8))
+        self.clustering_summary_tree.column("clusters", anchor="center", width=90)
+        self.clustering_summary_tree.column("rows", anchor="center", width=90)
+        self.clustering_summary_tree.column("silhouette", anchor="center", width=110)
+        self.clustering_summary_tree.column("ari", anchor="center", width=90)
+        self.clustering_summary_tree.column("nmi", anchor="center", width=90)
+        self.clustering_summary_tree.pack(fill="x", pady=(4, 4))
+
+        ttk.Label(
+            summary_frame,
+            textvariable=self.clustering_metric_best_var,
+            wraplength=760,
+            foreground="#444444",
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        stability_frame = ttk.LabelFrame(
+            results_tab, text="Stability overview", padding=12
+        )
+        stability_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        metric_controls = ttk.Frame(stability_frame)
+        metric_controls.pack(anchor="w")
+        ttk.Label(metric_controls, text="Metric").pack(side="left")
+        metric_combo = ttk.Combobox(
+            metric_controls,
+            textvariable=self.clustering_metric_choice_var,
+            state="readonly",
+            values=["Silhouette", "ARI", "NMI"],
+            width=14,
+        )
+        metric_combo.pack(side="left", padx=(6, 0))
+        metric_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: self._refresh_clustering_metrics_view(),
+        )
+
+        self.clustering_metrics_fig = Figure(figsize=(6.5, 3.4), dpi=100)
+        self.clustering_metrics_ax = self.clustering_metrics_fig.add_subplot(111)
+        self.clustering_metrics_ax.set_title("Run clustering to compute metrics")
+        self.clustering_metrics_ax.set_xlabel("Runs")
+        self.clustering_metrics_ax.set_ylabel("Score")
+        metrics_canvas = FigureCanvasTkAgg(
+            self.clustering_metrics_fig, master=stability_frame
+        )
+        metrics_widget = metrics_canvas.get_tk_widget()
+        metrics_widget.pack(fill="both", expand=True, pady=(8, 0))
+        self._make_canvas_responsive(metrics_canvas, self.clustering_metrics_fig, min_height=220)
+        self.clustering_metrics_canvas = metrics_canvas
 
         clusters_frame = ttk.Frame(results_tab)
         clusters_frame.pack(fill="both", expand=True)
@@ -3102,6 +3330,54 @@ class FlowDataApp:
         if for_key:
             formatted = formatted.replace("-", "m").replace(".", "p")
         return formatted
+
+    @staticmethod
+    def _format_metric_value(value: Optional[float]) -> str:
+        if value is None:
+            return "—"
+        return f"{float(value):.3f}"
+
+    @staticmethod
+    def _evaluate_clustering_metrics(
+        labels: np.ndarray,
+        features_scaled: np.ndarray,
+        class_labels: Optional[pd.Series],
+    ) -> Dict[str, Optional[float]]:
+        metrics: Dict[str, Optional[float]] = {
+            "silhouette": None,
+            "ari": None,
+            "nmi": None,
+        }
+        if features_scaled.shape[0] >= 2:
+            unique_labels = np.unique(labels)
+            if 1 < unique_labels.size < features_scaled.shape[0]:
+                try:
+                    metrics["silhouette"] = float(
+                        silhouette_score(features_scaled, labels)
+                    )
+                except ValueError:
+                    metrics["silhouette"] = None
+        if class_labels is not None:
+            class_series = class_labels.reset_index(drop=True)
+            valid_mask = ~class_series.isna()
+            if valid_mask.any():
+                y_true = class_series[valid_mask]
+                y_pred = np.asarray(labels)[valid_mask.to_numpy()]
+                if y_true.shape[0] >= 2:
+                    if y_true.nunique() > 1 and np.unique(y_pred).size > 1:
+                        try:
+                            metrics["ari"] = float(
+                                adjusted_rand_score(y_true, y_pred)
+                            )
+                        except ValueError:
+                            metrics["ari"] = None
+                        try:
+                            metrics["nmi"] = float(
+                                normalized_mutual_info_score(y_true, y_pred)
+                            )
+                        except ValueError:
+                            metrics["nmi"] = None
+        return metrics
 
     def _build_clustering_run_key(
         self,
@@ -5886,6 +6162,7 @@ class FlowDataApp:
         ],
         n_jobs: int,
         base_metadata: Dict[str, object],
+        class_column: Optional[str],
     ) -> None:
         try:
             base_metadata = dict(base_metadata)
@@ -5895,6 +6172,13 @@ class FlowDataApp:
             errors: List[str] = []
             metadata: Dict[str, Dict[str, object]] = {}
             label_map: Dict[str, str] = {}
+            metrics_records: List[Dict[str, object]] = []
+
+            class_series: Optional[pd.Series]
+            if class_column and class_column in dataset.columns:
+                class_series = dataset[class_column]
+            else:
+                class_series = None
 
             max_workers = max(1, min(len(selected_methods), n_jobs))
 
@@ -5942,6 +6226,12 @@ class FlowDataApp:
                     str(cluster_value): int(cluster_size)
                     for cluster_value, cluster_size in counts.items()
                 }
+                metrics = self._evaluate_clustering_metrics(
+                    labels_array,
+                    features_scaled,
+                    class_series,
+                )
+                summary_entry.update(metrics)
                 meta_entry = {
                     "run_key": run_key,
                     "method_key": method_key,
@@ -5952,8 +6242,12 @@ class FlowDataApp:
                     "elapsed_sec": elapsed,
                     "cluster_sizes": cluster_sizes,
                 }
+                meta_entry["metrics"] = {
+                    metric_key: float(value) if value is not None else None
+                    for metric_key, value in metrics.items()
+                }
                 meta_entry["params"] = self._to_serializable(meta_entry["params"])
-                return summary_entry, cluster_entries, assignment_df, meta_entry
+                return summary_entry, cluster_entries, assignment_df, meta_entry, metrics
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
@@ -5969,6 +6263,7 @@ class FlowDataApp:
                             cluster_entries,
                             assignment_df,
                             meta_entry,
+                            metrics,
                         ) = future.result()
                         results_summary.append(summary_entry)
                         cluster_breakdown.extend(cluster_entries)
@@ -5977,6 +6272,16 @@ class FlowDataApp:
                         metadata_entry.update(meta_entry)
                         metadata[run_key] = self._to_serializable(metadata_entry)
                         label_map[run_key] = run_label
+                        metrics_records.append(
+                            {
+                                "run_key": run_key,
+                                "method_key": method_key,
+                                "method_label": label,
+                                "silhouette": metrics.get("silhouette"),
+                                "ari": metrics.get("ari"),
+                                "nmi": metrics.get("nmi"),
+                            }
+                        )
                     except ImportError as exc:
                         errors.append(f"{label}: missing dependency ({exc}).")
                         params_serializable = self._to_serializable(params)
@@ -6015,6 +6320,7 @@ class FlowDataApp:
                 "metadata": metadata,
                 "base_metadata": self._to_serializable(base_metadata),
                 "labels": label_map,
+                "metrics": metrics_records,
             }
             self.clustering_queue.put({"status": "success", "payload": payload})
         except Exception as exc:  # noqa: BLE001
@@ -6039,6 +6345,76 @@ class FlowDataApp:
             )
             labels = model.fit_predict(features_scaled)
             return labels
+
+        if method_key == "gmm":
+            n_components = max(1, int(params["n_components"]))
+            covariance_type = str(params.get("covariance_type", "full"))
+            reg_covar = max(1e-9, float(params.get("reg_covar", 1e-6)))
+            n_init = max(1, int(params.get("n_init", 1)))
+            model = GaussianMixture(
+                n_components=n_components,
+                covariance_type=covariance_type,
+                reg_covar=reg_covar,
+                n_init=n_init,
+                random_state=RANDOM_STATE,
+            )
+            return model.fit_predict(features_scaled)
+
+        if method_key == "spectral":
+            n_clusters = max(2, int(params["n_clusters"]))
+            assign_labels = str(params.get("assign_labels", "kmeans"))
+            affinity = str(params.get("affinity", "rbf"))
+            gamma = max(0.0, float(params.get("gamma", 1.0)))
+            n_neighbors = max(2, int(params.get("n_neighbors", 10)))
+            kwargs: Dict[str, object] = {
+                "n_clusters": n_clusters,
+                "assign_labels": assign_labels,
+                "random_state": RANDOM_STATE,
+            }
+            if affinity == "nearest_neighbors":
+                kwargs["affinity"] = "nearest_neighbors"
+                kwargs["n_neighbors"] = n_neighbors
+            else:
+                kwargs["affinity"] = "rbf"
+                kwargs["gamma"] = max(1e-9, gamma)
+            model = SpectralClustering(**kwargs)
+            return model.fit_predict(features_scaled)
+
+        if method_key == "agglomerative":
+            n_clusters = max(2, int(params["n_clusters"]))
+            linkage = str(params.get("linkage", "ward"))
+            metric = str(params.get("metric", "euclidean"))
+            if linkage == "ward":
+                metric = "euclidean"
+            model = AgglomerativeClustering(
+                n_clusters=n_clusters,
+                linkage=linkage,
+                metric=metric,
+            )
+            return model.fit_predict(features_scaled)
+
+        if method_key == "hdbscan":
+            if hdbscan is None:
+                raise ImportError("hdbscan")
+            min_cluster_size = max(2, int(params["min_cluster_size"]))
+            min_samples_val = params.get("min_samples")
+            try:
+                min_samples = int(min_samples_val) if min_samples_val is not None else None
+            except (TypeError, ValueError):
+                min_samples = None
+            if min_samples is not None and min_samples <= 0:
+                min_samples = None
+            cluster_selection_method = str(
+                params.get("cluster_selection_method", "eom")
+            ).lower()
+            hdbscan_kwargs: Dict[str, object] = {
+                "min_cluster_size": min_cluster_size,
+                "cluster_selection_method": cluster_selection_method,
+            }
+            if min_samples is not None:
+                hdbscan_kwargs["min_samples"] = min_samples
+            model = hdbscan.HDBSCAN(**hdbscan_kwargs)
+            return model.fit_predict(features_scaled)
 
         if method_key == "leiden":
             if ig is None or leidenalg is None:
@@ -6147,6 +6523,106 @@ class FlowDataApp:
         else:
             self._handle_clustering_failure(message["message"])
 
+    def _refresh_clustering_metrics_view(self) -> None:
+        metric_map = {
+            "Silhouette": "silhouette",
+            "ARI": "ari",
+            "NMI": "nmi",
+        }
+        metric_label = self.clustering_metric_choice_var.get()
+        metric_key = metric_map.get(metric_label, "silhouette")
+        records = self.clustering_metrics_records or []
+        if not records:
+            self.clustering_metric_best_var.set(
+                "Run clustering to compute stability metrics."
+            )
+            self._update_clustering_metric_plot(metric_key)
+            return
+
+        best_value: Optional[float] = None
+        best_record: Optional[Dict[str, object]] = None
+        for record in records:
+            value = record.get(metric_key)
+            if value is None:
+                continue
+            numeric = float(value)
+            if best_value is None or numeric > best_value:
+                best_value = numeric
+                best_record = record
+
+        if best_record is not None and best_value is not None:
+            method_label = str(
+                best_record.get("method_label", best_record.get("run_key", ""))
+            )
+            self.clustering_metric_best_var.set(
+                f"Best {metric_label.lower()} run: {method_label} ({best_value:.3f})."
+            )
+        else:
+            self.clustering_metric_best_var.set(
+                f"No {metric_label.lower()} scores available for the evaluated runs."
+            )
+        self._update_clustering_metric_plot(metric_key)
+
+    def _update_clustering_metric_plot(self, metric_key: Optional[str] = None) -> None:
+        if (
+            self.clustering_metrics_ax is None
+            or self.clustering_metrics_fig is None
+            or self.clustering_metrics_canvas is None
+        ):
+            return
+        metric_map = {
+            "Silhouette": "silhouette",
+            "ARI": "ari",
+            "NMI": "nmi",
+        }
+        metric_label = self.clustering_metric_choice_var.get()
+        metric_key = metric_key or metric_map.get(metric_label, "silhouette")
+        records = self.clustering_metrics_records or []
+        ax = self.clustering_metrics_ax
+        ax.clear()
+        ax.set_xlabel("Runs")
+        ax.set_ylabel(metric_label)
+
+        values: List[float] = []
+        labels: List[str] = []
+        for record in records:
+            value = record.get(metric_key)
+            if value is None:
+                continue
+            values.append(float(value))
+            labels.append(str(record.get("method_label", record.get("run_key", ""))))
+
+        if not values:
+            ax.set_title(f"No {metric_label.lower()} scores available")
+            ax.set_xticks([])
+            if metric_key == "silhouette":
+                ax.set_ylim(-1.0, 1.0)
+            else:
+                ax.set_ylim(0.0, 1.0)
+            self.clustering_metrics_canvas.draw_idle()
+            return
+
+        positions = np.arange(len(values))
+        bars = ax.bar(positions, values, color="#4F81BD")
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, rotation=45, ha="right")
+        ax.set_title(f"{metric_label} across sweeps")
+        if metric_key == "silhouette":
+            ax.set_ylim(-1.0, 1.0)
+        else:
+            ax.set_ylim(0.0, 1.0)
+        for rect, value in zip(bars, values):
+            ax.text(
+                rect.get_x() + rect.get_width() / 2.0,
+                value,
+                f"{value:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        self._finalize_figure_layout(self.clustering_metrics_fig, bottom=0.35)
+        self.clustering_metrics_canvas.draw_idle()
+
     def _handle_clustering_success(self, payload: Dict[str, object]) -> None:
         self.clustering_in_progress = False
         self.clustering_progress.stop()
@@ -6157,6 +6633,7 @@ class FlowDataApp:
         clusters: List[Dict[str, object]] = payload.get("clusters", [])  # type: ignore[assignment]
         assignments: Dict[str, pd.DataFrame] = payload.get("assignments", {})  # type: ignore[assignment]
         labels_map: Dict[str, str] = payload.get("labels", {})  # type: ignore[assignment]
+        metrics_payload: List[Dict[str, object]] = payload.get("metrics", [])  # type: ignore[assignment]
 
         self.clustering_results = assignments
         self.clustering_metadata = payload.get("metadata", {})
@@ -6168,6 +6645,35 @@ class FlowDataApp:
         features_meta = payload.get("features")
         if isinstance(features_meta, list) and features_meta:
             self.clustering_features_used = [str(f) for f in features_meta]
+
+        converted_metrics: List[Dict[str, object]] = []
+        for record in metrics_payload:
+            silhouette = record.get("silhouette")
+            ari = record.get("ari")
+            nmi = record.get("nmi")
+            converted_metrics.append(
+                {
+                    "run_key": record.get("run_key"),
+                    "method_key": record.get("method_key"),
+                    "method_label": record.get("method_label"),
+                    "silhouette": float(silhouette) if silhouette is not None else None,
+                    "ari": float(ari) if ari is not None else None,
+                    "nmi": float(nmi) if nmi is not None else None,
+                }
+            )
+        if not converted_metrics:
+            converted_metrics = [
+                {
+                    "run_key": record.get("run_key"),
+                    "method_key": record.get("method_key"),
+                    "method_label": record.get("method_label"),
+                    "silhouette": float(record["silhouette"]) if record.get("silhouette") is not None else None,
+                    "ari": float(record["ari"]) if record.get("ari") is not None else None,
+                    "nmi": float(record["nmi"]) if record.get("nmi") is not None else None,
+                }
+                for record in summary
+            ]
+        self.clustering_metrics_records = converted_metrics
 
         if hasattr(self, "clustering_summary_tree"):
             self.clustering_summary_tree.delete(
@@ -6183,6 +6689,9 @@ class FlowDataApp:
                         record.get("method_label"),
                         record.get("cluster_count"),
                         record.get("rows"),
+                        self._format_metric_value(record.get("silhouette")),
+                        self._format_metric_value(record.get("ari")),
+                        self._format_metric_value(record.get("nmi")),
                     ),
                 )
 
@@ -6224,6 +6733,7 @@ class FlowDataApp:
         self.pending_clustering_labels = {}
 
         self._update_clustering_visual_controls()
+        self._refresh_clustering_metrics_view()
 
         if errors:
             messagebox.showwarning(
@@ -6822,6 +7332,17 @@ class FlowDataApp:
             self._update_heatmap_canvas(base_fig)
             self.clustering_heatmap_ax = base_ax
             self.clustering_heatmap_canvas.draw_idle()
+        self.clustering_metrics_records = []
+        self.clustering_metric_best_var.set(
+            "Run clustering to compute stability metrics."
+        )
+        if self.clustering_metrics_ax is not None:
+            self.clustering_metrics_ax.clear()
+            self.clustering_metrics_ax.set_title("Run clustering to compute metrics")
+            self.clustering_metrics_ax.set_xlabel("Runs")
+            self.clustering_metrics_ax.set_ylabel(self.clustering_metric_choice_var.get())
+            if self.clustering_metrics_canvas is not None:
+                self.clustering_metrics_canvas.draw_idle()
         if self.cluster_explorer_cluster_listbox is not None:
             self.cluster_explorer_cluster_listbox.delete(0, tk.END)
         for plot in self.cluster_explorer_plots:
@@ -6909,6 +7430,15 @@ class FlowDataApp:
                 "Missing data",
                 "The prepared dataset is missing required columns:\n"
                 + ", ".join(missing_in_dataset),
+            )
+            return
+
+        class_column_raw = self.clustering_class_var.get().strip()
+        class_column = class_column_raw or None
+        if class_column and class_column not in dataset.columns:
+            messagebox.showerror(
+                "Missing class column",
+                "The selected reference column for metrics is missing in the dataset.",
             )
             return
 
@@ -7039,7 +7569,7 @@ class FlowDataApp:
             "downsampling": {
                 "method": downsample_method,
                 "value": downsample_value,
-                "class_column": self.clustering_class_var.get() or None,
+                "class_column": class_column,
             },
             "n_jobs": int(self.clustering_n_jobs_var.get()),
             "subset": {
@@ -7048,6 +7578,7 @@ class FlowDataApp:
                 "rows_after_filters": len(base_dataset),
                 "logic": (self.clustering_filter_mode_var.get() or "AND").upper(),
             },
+            "metrics": {"class_column": class_column},
         }
         self.clustering_run_metadata_base = base_metadata.copy()
 
@@ -7068,6 +7599,7 @@ class FlowDataApp:
                 selected_methods,
                 clustering_jobs,
                 base_metadata,
+                class_column,
             ),
             daemon=True,
         )
