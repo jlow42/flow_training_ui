@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import re
 import sys
 import tkinter as tk
@@ -13,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
-from threading import Thread
+from threading import Thread, Event
 from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
@@ -34,6 +35,7 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from reductions import ReductionRunner, ReductionCancelled, ReductionError
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -721,12 +723,25 @@ class FlowDataApp:
         self.clustering_umap_cache: Dict[tuple, np.ndarray] = {}
         self.clustering_umap_colorbar = None
         self.clustering_umap_show_labels_var = tk.BooleanVar(value=False)
-        self.clustering_umap_downsample_var = tk.BooleanVar(value=False)
+        self.clustering_umap_downsample_var = tk.BooleanVar(value=True)
         self.clustering_umap_max_cells_var = tk.IntVar(value=20000)
         self.clustering_umap_jobs_var = tk.IntVar(value=max(1, min(self.total_cpu_cores, 4)))
         self.clustering_umap_dot_size_var = tk.DoubleVar(value=6.0)
         self.clustering_umap_alpha_var = tk.DoubleVar(value=0.8)
         self.clustering_umap_marker_var = tk.StringVar()
+        self.clustering_reduction_method_var = tk.StringVar(value="UMAP")
+        self.clustering_reduction_strategy_var = tk.StringVar(value="Auto")
+        self.clustering_reduction_status_var = tk.StringVar(
+            value="Select a clustering run to compute embeddings."
+        )
+        self.reduction_queue: "queue.Queue[dict]" = queue.Queue()
+        self.reduction_thread: Optional[Thread] = None
+        self.reduction_in_progress = False
+        self.reduction_cancel_event = Event()
+        self.reduction_job_id: Optional[str] = None
+        self.reduction_runner = ReductionRunner()
+        self.clustering_feature_signature: Optional[str] = None
+        self.clustering_reduction_last_method: Optional[str] = None
         self.clustering_heatmap_colorbar = None
         self.clustering_heatmap_cluster_dendro_var = tk.BooleanVar(value=False)
         self.clustering_heatmap_marker_dendro_var = tk.BooleanVar(value=False)
@@ -2259,8 +2274,10 @@ class FlowDataApp:
         viz_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         viz_tab.pack(fill="both", expand=True)
 
-        # UMAP controls
-        umap_frame = ttk.LabelFrame(viz_tab, text="UMAP Projection", padding=12)
+        # Dimensionality reduction controls
+        umap_frame = ttk.LabelFrame(
+            viz_tab, text="Dimensionality Reduction", padding=12
+        )
         umap_frame.pack(fill="both", expand=False)
 
         self.clustering_umap_method_var = tk.StringVar()
@@ -2305,6 +2322,21 @@ class FlowDataApp:
         )
         self.clustering_umap_marker_combo.grid(row=1, column=2, sticky="w")
 
+        ttk.Label(umap_frame, text="Reduction method").grid(
+            row=0, column=3, sticky="w"
+        )
+        self.clustering_reduction_method_combo = ttk.Combobox(
+            umap_frame,
+            textvariable=self.clustering_reduction_method_var,
+            state="readonly",
+            values=["UMAP", "PCA", "ICA", "PHATE"],
+            width=18,
+        )
+        self.clustering_reduction_method_combo.grid(row=1, column=3, sticky="w")
+        self.clustering_reduction_method_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self._on_reduction_method_changed()
+        )
+
         params_frame = ttk.Frame(umap_frame)
         params_frame.grid(row=2, column=0, columnspan=3, pady=(12, 0), sticky="w")
         self.clustering_umap_neighbors_var = tk.IntVar(value=15)
@@ -2312,17 +2344,18 @@ class FlowDataApp:
         self.clustering_umap_metric_var = tk.StringVar(value="euclidean")
 
         ttk.Label(params_frame, text="Neighbors").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(
+        self.clustering_reduction_neighbors_spin = ttk.Spinbox(
             params_frame,
             from_=5,
             to=200,
             increment=1,
             textvariable=self.clustering_umap_neighbors_var,
             width=6,
-        ).grid(row=1, column=0, sticky="w")
+        )
+        self.clustering_reduction_neighbors_spin.grid(row=1, column=0, sticky="w")
 
         ttk.Label(params_frame, text="Min dist").grid(row=0, column=1, padx=(12, 0), sticky="w")
-        ttk.Spinbox(
+        self.clustering_reduction_min_dist_spin = ttk.Spinbox(
             params_frame,
             from_=0.0,
             to=1.0,
@@ -2330,16 +2363,18 @@ class FlowDataApp:
             textvariable=self.clustering_umap_min_dist_var,
             width=6,
             format="%.2f",
-        ).grid(row=1, column=1, padx=(12, 0), sticky="w")
+        )
+        self.clustering_reduction_min_dist_spin.grid(row=1, column=1, padx=(12, 0), sticky="w")
 
         ttk.Label(params_frame, text="Metric").grid(row=0, column=2, padx=(12, 0), sticky="w")
-        ttk.Combobox(
+        self.clustering_reduction_metric_combo = ttk.Combobox(
             params_frame,
             textvariable=self.clustering_umap_metric_var,
             state="readonly",
             values=["euclidean", "manhattan", "cosine"],
             width=10,
-        ).grid(row=1, column=2, padx=(12, 0), sticky="w")
+        )
+        self.clustering_reduction_metric_combo.grid(row=1, column=2, padx=(12, 0), sticky="w")
 
         ttk.Label(params_frame, text="Dot size").grid(row=0, column=3, padx=(12, 0), sticky="w")
         self.clustering_umap_dot_size_var = tk.DoubleVar(value=6.0)
@@ -2365,25 +2400,35 @@ class FlowDataApp:
             format="%.2f",
         ).grid(row=1, column=4, padx=(12, 0), sticky="w")
 
-        ttk.Button(
+        self.clustering_reduction_button = ttk.Button(
             params_frame,
-            text="Generate UMAP",
-            command=self._generate_clustering_umap,
-        ).grid(row=1, column=5, padx=(18, 0), sticky="w")
+            text="Run reduction",
+            command=self._request_reduction_job,
+        )
+        self.clustering_reduction_button.grid(row=1, column=5, padx=(18, 0), sticky="w")
 
         self.clustering_umap_fig = Figure(figsize=(7, 5.5), dpi=100)
         self.clustering_umap_ax = self.clustering_umap_fig.add_subplot(111)
-        self.clustering_umap_ax.set_title("Run clustering to generate UMAP")
+        self.clustering_umap_ax.set_title("Run clustering to generate an embedding")
         self.clustering_umap_ax.set_xticks([])
         self.clustering_umap_ax.set_yticks([])
         button_frame = ttk.Frame(umap_frame)
         button_frame.grid(row=2, column=3, padx=(18, 0), sticky="nw")
-        ttk.Label(button_frame, text="Downsample cells").pack(anchor="w")
+        ttk.Label(button_frame, text="Subsampling strategy").pack(anchor="w")
+        self.clustering_reduction_sampling_combo = ttk.Combobox(
+            button_frame,
+            textvariable=self.clustering_reduction_strategy_var,
+            state="readonly",
+            values=["Auto", "Random", "Cluster-balanced", "Full dataset"],
+            width=18,
+        )
+        self.clustering_reduction_sampling_combo.pack(anchor="w")
+        self.clustering_reduction_sampling_combo.current(0)
         ttk.Checkbutton(
             button_frame,
-            text="Enable",
+            text="Allow downsampling",
             variable=self.clustering_umap_downsample_var,
-        ).pack(anchor="w")
+        ).pack(anchor="w", pady=(4, 0))
         ttk.Label(button_frame, text="Max cells").pack(anchor="w", pady=(4, 0))
         ttk.Spinbox(
             button_frame,
@@ -2407,21 +2452,43 @@ class FlowDataApp:
             text="Label centroids",
             variable=self.clustering_umap_show_labels_var,
         ).pack(anchor="w", pady=(4, 0))
-
-        umap_canvas = FigureCanvasTkAgg(self.clustering_umap_fig, master=umap_frame)
-        umap_canvas.get_tk_widget().grid(
-            row=3, column=0, columnspan=4, pady=(12, 0), sticky="nsew"
+        self.clustering_reduction_cancel_button = ttk.Button(
+            button_frame,
+            text="Cancel job",
+            command=self._cancel_reduction_job,
+            state="disabled",
         )
-        self._make_canvas_responsive(umap_canvas, self.clustering_umap_fig, min_height=260)
-        self.clustering_umap_canvas = umap_canvas
-
-        umap_frame.grid_columnconfigure(3, weight=1)
-        umap_frame.grid_rowconfigure(3, weight=1)
+        self.clustering_reduction_cancel_button.pack(anchor="w", pady=(6, 0))
         ttk.Button(
             button_frame,
             text="Save Figure…",
             command=self._save_clustering_umap_figure,
         ).pack(anchor="w", pady=(8, 0))
+
+        status_label = ttk.Label(
+            umap_frame,
+            textvariable=self.clustering_reduction_status_var,
+            foreground="#444444",
+        )
+        status_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        self.clustering_reduction_progress = ttk.Progressbar(
+            umap_frame, mode="indeterminate"
+        )
+        self.clustering_reduction_progress.grid(
+            row=4, column=0, columnspan=3, sticky="we", pady=(4, 0)
+        )
+
+        umap_canvas = FigureCanvasTkAgg(self.clustering_umap_fig, master=umap_frame)
+        umap_canvas.get_tk_widget().grid(
+            row=5, column=0, columnspan=4, pady=(12, 0), sticky="nsew"
+        )
+        self._make_canvas_responsive(umap_canvas, self.clustering_umap_fig, min_height=260)
+        self.clustering_umap_canvas = umap_canvas
+
+        umap_frame.grid_columnconfigure(3, weight=1)
+        umap_frame.grid_rowconfigure(5, weight=1)
+        self._on_reduction_method_changed()
 
         # Heatmap controls
         heatmap_frame = ttk.LabelFrame(viz_tab, text="Cluster Heatmap", padding=12)
@@ -5528,6 +5595,15 @@ class FlowDataApp:
         else:
             self.clustering_umap_marker_combo.configure(state="disabled")
 
+    def _on_reduction_method_changed(self) -> None:
+        method = (self.clustering_reduction_method_var.get() or "UMAP").lower()
+        requires_neighbors = method in {"umap", "phate"}
+        spin_state = "normal" if requires_neighbors else "disabled"
+        metric_state = "readonly" if requires_neighbors else "disabled"
+        self.clustering_reduction_neighbors_spin.configure(state=spin_state)
+        self.clustering_reduction_min_dist_spin.configure(state=spin_state)
+        self.clustering_reduction_metric_combo.configure(state=metric_state)
+
     def _on_heatmap_norm_changed(self) -> None:
         mode = self.clustering_heatmap_norm_var.get()
         state = "normal" if mode == "fixed" else "disabled"
@@ -5577,18 +5653,14 @@ class FlowDataApp:
                 return key
         return None
 
-    def _generate_clustering_umap(self) -> None:
-        if umap is None:
-            messagebox.showerror(
-                "UMAP unavailable",
-                "The umap-learn package is not installed. Install 'umap-learn' to enable this feature.",
-            )
-            return
-
+    def _request_reduction_job(self) -> None:
+        reduction_method = self.clustering_reduction_method_var.get() or "UMAP"
         method_label = self.clustering_umap_method_var.get()
         method_key = self._get_method_key_from_label(method_label) if method_label else None
         if not method_key or method_key not in self.clustering_results:
-            messagebox.showerror("No clustering results", "Run clustering before generating UMAP.")
+            messagebox.showerror(
+                "No clustering results", "Run clustering before generating embeddings."
+            )
             return
 
         assignment_df = self.clustering_results[method_key]
@@ -5601,62 +5673,327 @@ class FlowDataApp:
             messagebox.showerror("No features", "Clustering features are not available.")
             return
 
+        scaled_matrix = self.clustering_feature_matrix
+        base_signature = self.clustering_feature_signature
         if (
-            self.clustering_feature_matrix is not None
-            and self.clustering_dataset_cache is not None
-            and len(self.clustering_dataset_cache) == len(self.clustering_feature_matrix)
+            scaled_matrix is None
+            or base_signature is None
+            or len(scaled_matrix) != len(assignment_df)
         ):
-            scaled = self.clustering_feature_matrix
-        else:
-            scaled = StandardScaler().fit_transform(
+            scaled_matrix = StandardScaler().fit_transform(
                 assignment_df[features].to_numpy(dtype=float, copy=False)
             )
+            self.clustering_feature_matrix = scaled_matrix.copy()
+            base_signature = self._hash_feature_matrix(self.clustering_feature_matrix)
+            self.clustering_feature_signature = base_signature
 
-        selected_df = assignment_df
-        use_cache = True
-        if self.clustering_umap_downsample_var.get():
-            max_cells = max(1000, int(self.clustering_umap_max_cells_var.get()))
-            if len(assignment_df) > max_cells:
-                selected_df = assignment_df.sample(
-                    n=max_cells, random_state=RANDOM_STATE
-                ).sort_index()
-                use_cache = False
-
-        indices = selected_df.index.to_numpy()
-        scaled_subset = scaled[indices]
-
-        n_neighbors = max(5, int(self.clustering_umap_neighbors_var.get()))
-        min_dist = max(0.0, float(self.clustering_umap_min_dist_var.get()))
-        metric = self.clustering_umap_metric_var.get() or "euclidean"
-        umap_jobs = max(
-            1, min(int(self.clustering_umap_jobs_var.get()), self.total_cpu_cores)
-        )
-        cache_key = (n_neighbors, round(min_dist, 4), metric)
-        embedding: Optional[np.ndarray] = None
-        if use_cache:
-            embedding = self.clustering_umap_cache.get(cache_key)
-            if embedding is not None and len(embedding) != scaled.shape[0]:
-                embedding = None
-
-        if embedding is None:
-            reducer = umap.UMAP(
-                n_neighbors=n_neighbors,
-                min_dist=min_dist,
-                metric=metric,
-                random_state=RANDOM_STATE,
-                n_components=2,
-                n_jobs=umap_jobs,
+        allow_downsample = bool(self.clustering_umap_downsample_var.get())
+        max_cells = max(1000, int(self.clustering_umap_max_cells_var.get()))
+        strategy_label = self.clustering_reduction_strategy_var.get() or "Auto"
+        try:
+            indices, subset_message, strategy_used = self._prepare_reduction_subset(
+                assignment_df,
+                allow_downsample,
+                max_cells,
+                strategy_label,
             )
-            embedding_full = reducer.fit_transform(scaled)
-            if use_cache:
-                self.clustering_umap_cache[cache_key] = embedding_full
-            if use_cache:
-                embedding = embedding_full
-            else:
-                embedding = embedding_full[indices]
-        elif not use_cache:
-            embedding = embedding[indices]
+        except ValueError as exc:
+            messagebox.showerror("Subsampling error", str(exc))
+            return
 
+        if indices.size == 0:
+            messagebox.showerror(
+                "No data", "No cells are available for the selected reduction settings."
+            )
+            return
+
+        scaled_subset = np.ascontiguousarray(scaled_matrix[indices])
+        params = {
+            "n_neighbors": max(5, int(self.clustering_umap_neighbors_var.get())),
+            "min_dist": max(0.0, float(self.clustering_umap_min_dist_var.get())),
+            "metric": self.clustering_umap_metric_var.get() or "euclidean",
+            "n_jobs": max(
+                1, min(int(self.clustering_umap_jobs_var.get()), self.total_cpu_cores)
+            ),
+        }
+
+        if self.reduction_in_progress:
+            self.reduction_cancel_event.set()
+
+        self.reduction_queue = queue.Queue()
+        self.reduction_cancel_event = Event()
+        self.reduction_in_progress = True
+        self.reduction_job_id = uuid.uuid4().hex
+        self.clustering_reduction_status_var.set("Running reduction…")
+        self.clustering_reduction_progress.start(12)
+        self.clustering_reduction_button.configure(state="disabled")
+        self.clustering_reduction_cancel_button.configure(state="normal")
+
+        self.reduction_thread = Thread(
+            target=self._run_reduction_worker,
+            args=(
+                self.reduction_job_id,
+                method_key,
+                reduction_method,
+                scaled_subset,
+                params,
+                indices.tolist(),
+                subset_message,
+                strategy_used,
+                base_signature,
+                len(assignment_df),
+                self.reduction_cancel_event,
+            ),
+            daemon=True,
+        )
+        self.reduction_thread.start()
+        self.root.after(200, self._poll_reduction_queue)
+
+    def _run_reduction_worker(
+        self,
+        job_id: str,
+        method_key: str,
+        reduction_method: str,
+        data: np.ndarray,
+        params: Dict[str, object],
+        indices: List[int],
+        subset_message: str,
+        strategy_used: str,
+        base_signature: Optional[str],
+        total_rows: int,
+        cancel_event: Event,
+    ) -> None:
+        try:
+            embedding, elapsed = self.reduction_runner.run(
+                reduction_method,
+                data,
+                n_components=2,
+                n_neighbors=int(params["n_neighbors"]),
+                min_dist=float(params["min_dist"]),
+                metric=str(params["metric"]),
+                n_jobs=int(params["n_jobs"]),
+                random_state=RANDOM_STATE,
+                cancel_event=cancel_event,
+            )
+            self.reduction_queue.put(
+                {
+                    "status": "success",
+                    "job_id": job_id,
+                    "method_key": method_key,
+                    "reduction_method": reduction_method,
+                    "embedding": embedding,
+                    "indices": indices,
+                    "elapsed": elapsed,
+                    "subset_message": subset_message,
+                    "strategy": strategy_used,
+                    "base_signature": base_signature,
+                    "total_rows": total_rows,
+                }
+            )
+        except ReductionCancelled:
+            self.reduction_queue.put({"status": "cancelled", "job_id": job_id})
+        except ReductionError as exc:
+            self.reduction_queue.put(
+                {"status": "error", "job_id": job_id, "message": str(exc)}
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.reduction_queue.put(
+                {"status": "error", "job_id": job_id, "message": str(exc)}
+            )
+
+    def _poll_reduction_queue(self) -> None:
+        if not self.reduction_in_progress:
+            return
+        try:
+            message = self.reduction_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(200, self._poll_reduction_queue)
+            return
+
+        job_id = message.get("job_id")
+        if job_id != self.reduction_job_id:
+            self.root.after(200, self._poll_reduction_queue)
+            return
+
+        status = message.get("status")
+        if status == "success":
+            self._handle_reduction_success(message)
+        elif status == "cancelled":
+            self._handle_reduction_cancelled()
+        else:
+            self._handle_reduction_failure(str(message.get("message", "Unknown error.")))
+
+    def _handle_reduction_success(self, payload: Dict[str, object]) -> None:
+        self.reduction_in_progress = False
+        self.clustering_reduction_progress.stop()
+        self.clustering_reduction_button.configure(state="normal")
+        self.clustering_reduction_cancel_button.configure(state="disabled")
+        self.reduction_thread = None
+
+        payload_signature = payload.get("base_signature")
+        if (
+            payload_signature is not None
+            and self.clustering_feature_signature is not None
+            and payload_signature != self.clustering_feature_signature
+        ):
+            self.clustering_reduction_status_var.set(
+                "Discarded outdated reduction result (underlying data changed)."
+            )
+            return
+
+        method_key = payload.get("method_key")
+        if not isinstance(method_key, str) or method_key not in self.clustering_results:
+            self.clustering_reduction_status_var.set(
+                "Reduction result received for an unknown clustering run."
+            )
+            return
+
+        assignment_df = self.clustering_results[method_key]
+        embedding = payload.get("embedding")
+        indices_list = payload.get("indices", [])
+        if not isinstance(embedding, np.ndarray):
+            self.clustering_reduction_status_var.set("Reduction result is malformed.")
+            return
+        indices = np.array(indices_list, dtype=int)
+        try:
+            self._render_reduction_embedding(
+                assignment_df,
+                indices,
+                embedding,
+                str(payload.get("reduction_method", "UMAP")),
+            )
+        except ValueError as exc:
+            self.clustering_reduction_status_var.set(str(exc))
+            return
+
+        elapsed = float(payload.get("elapsed", 0.0))
+        total_rows = int(payload.get("total_rows", len(assignment_df)))
+        subset_message = str(payload.get("subset_message", "")).strip()
+        method_label = str(payload.get("reduction_method", "UMAP")).upper()
+        shown_points = embedding.shape[0]
+        status_parts = [
+            f"{method_label} ready in {elapsed:.2f}s (showing {shown_points} of {total_rows} cells)."
+        ]
+        if subset_message:
+            status_parts.append(subset_message)
+        self.clustering_reduction_status_var.set(" ".join(status_parts))
+
+    def _handle_reduction_failure(self, message: str) -> None:
+        self.reduction_in_progress = False
+        self.clustering_reduction_progress.stop()
+        self.clustering_reduction_button.configure(state="normal")
+        self.clustering_reduction_cancel_button.configure(state="disabled")
+        self.reduction_thread = None
+        self.clustering_reduction_status_var.set(f"Reduction failed: {message}")
+
+    def _handle_reduction_cancelled(self) -> None:
+        self.reduction_in_progress = False
+        self.clustering_reduction_progress.stop()
+        self.clustering_reduction_button.configure(state="normal")
+        self.clustering_reduction_cancel_button.configure(state="disabled")
+        self.reduction_thread = None
+        self.clustering_reduction_status_var.set("Reduction cancelled.")
+
+    def _cancel_reduction_job(self) -> None:
+        if self.reduction_in_progress:
+            self.reduction_cancel_event.set()
+            self.clustering_reduction_status_var.set("Cancelling reduction…")
+
+    def _prepare_reduction_subset(
+        self,
+        dataframe: pd.DataFrame,
+        allow_downsample: bool,
+        max_cells: int,
+        strategy_label: str,
+    ) -> tuple[np.ndarray, str, str]:
+        total = len(dataframe)
+        if total == 0:
+            return np.array([], dtype=int), "No data available.", "empty"
+
+        if max_cells <= 0:
+            max_cells = total
+
+        strategy = strategy_label.lower()
+        if not allow_downsample or strategy == "full dataset" or total <= max_cells:
+            return (
+                dataframe.index.to_numpy(dtype=int, copy=False),
+                f"Using all {total} cells.",
+                "full",
+            )
+
+        if strategy == "auto":
+            if "cluster" in dataframe.columns and dataframe["cluster"].nunique() > 1:
+                strategy_mode = "cluster-balanced"
+            else:
+                strategy_mode = "random"
+        else:
+            strategy_mode = strategy
+
+        if strategy_mode == "cluster-balanced" and "cluster" not in dataframe.columns:
+            strategy_mode = "random"
+
+        if strategy_mode == "cluster-balanced":
+            clusters = dataframe["cluster"].astype(str)
+            unique_clusters = clusters.nunique()
+            if unique_clusters == 0:
+                return (
+                    dataframe.index.to_numpy(),
+                    f"Using all {total} cells.",
+                    "full",
+                )
+            selected_indices: List[int] = []
+            remaining = max_cells
+            for cluster_value, group in dataframe.groupby("cluster"):
+                if remaining <= 0:
+                    break
+                quota = max(1, int(round(len(group) / total * max_cells)))
+                quota = min(quota, len(group), remaining)
+                sample = group.sample(n=quota, random_state=RANDOM_STATE)
+                selected_indices.extend(sample.index.tolist())
+                remaining -= len(sample)
+            if remaining > 0:
+                remaining_pool = dataframe.index.difference(selected_indices)
+                if len(remaining_pool) > 0:
+                    extra = dataframe.loc[remaining_pool].sample(
+                        n=min(remaining, len(remaining_pool)),
+                        random_state=RANDOM_STATE,
+                    )
+                    selected_indices.extend(extra.index.tolist())
+            if not selected_indices:
+                sample = dataframe.sample(n=min(max_cells, total), random_state=RANDOM_STATE)
+                selected_indices = sample.index.tolist()
+            index_series = pd.Index(selected_indices)
+            if index_series.has_duplicates:
+                index_series = index_series.drop_duplicates()
+            if len(index_series) > max_cells:
+                index_series = (
+                    index_series.to_series()
+                    .sample(n=max_cells, random_state=RANDOM_STATE)
+                    .sort_values()
+                    .index
+                )
+            indices = np.sort(index_series.to_numpy(dtype=int, copy=False))
+            message = (
+                f"Cluster-balanced subsampling to {indices.size} of {total} cells."
+            )
+            return indices, message, "cluster-balanced"
+
+        # Default random strategy
+        sample = dataframe.sample(n=min(max_cells, total), random_state=RANDOM_STATE)
+        sample = sample.sort_index()
+        indices = sample.index.to_numpy(dtype=int, copy=False)
+        message = f"Random subsampling to {len(indices)} of {total} cells."
+        return indices, message, "random"
+
+    def _render_reduction_embedding(
+        self,
+        assignment_df: pd.DataFrame,
+        indices: np.ndarray,
+        embedding: np.ndarray,
+        reduction_method: str,
+    ) -> None:
+        if embedding.shape[0] != len(indices):
+            raise ValueError("Reduction result size mismatch.")
         ax = self.clustering_umap_ax
         if self.clustering_umap_colorbar is not None:
             try:
@@ -5666,46 +6003,48 @@ class FlowDataApp:
             finally:
                 self.clustering_umap_colorbar = None
         ax.clear()
+        selected_df = assignment_df.loc[indices]
         mode = self.clustering_umap_color_mode_var.get()
+        dot_size = max(1.0, float(self.clustering_umap_dot_size_var.get()))
+        alpha = max(0.05, min(1.0, float(self.clustering_umap_alpha_var.get())))
+        reduction_label = reduction_method.upper()
+
         if mode == "marker":
             marker = self.clustering_umap_marker_var.get()
             if not marker:
-                messagebox.showerror("No marker", "Select a marker to color by expression.")
-                return
-            if marker not in assignment_df.columns:
-                messagebox.showerror("Marker missing", f"Marker '{marker}' not found in dataset.")
-                return
+                raise ValueError("Select a marker to color by expression.")
+            if marker not in selected_df.columns:
+                raise ValueError(f"Marker '{marker}' not found in the dataset.")
             values = selected_df[marker].to_numpy(dtype=float, copy=False)
-            n_points = len(selected_df)
             scatter = ax.scatter(
                 embedding[:, 0],
                 embedding[:, 1],
                 c=values,
                 cmap="viridis",
-                s=max(1.0, float(self.clustering_umap_dot_size_var.get())),
+                s=dot_size,
                 linewidths=0,
-                alpha=max(0.05, min(1.0, float(self.clustering_umap_alpha_var.get()))),
+                alpha=alpha,
             )
             cbar = self.clustering_umap_fig.colorbar(scatter, ax=ax)
             cbar.set_label(marker)
             self.clustering_umap_colorbar = cbar
-            ax.set_title(f"UMAP colored by {marker} (n={n_points})")
+            ax.set_title(f"{reduction_label} colored by {marker} (n={len(selected_df)})")
         else:
             clusters = selected_df["cluster"].astype(str).to_numpy()
             unique_clusters = sorted(pd.unique(clusters))
             cmap = ListedColormap(cm.tab20.colors[: len(unique_clusters)])
             cluster_to_index = {cluster: idx for idx, cluster in enumerate(unique_clusters)}
             colors = [cluster_to_index[c] for c in clusters]
-            scatter = ax.scatter(
+            ax.scatter(
                 embedding[:, 0],
                 embedding[:, 1],
                 c=colors,
                 cmap=cmap,
-                s=max(1.0, float(self.clustering_umap_dot_size_var.get())),
+                s=dot_size,
                 linewidths=0,
-                alpha=max(0.05, min(1.0, float(self.clustering_umap_alpha_var.get()))),
+                alpha=alpha,
             )
-            ax.set_title(f"UMAP colored by clusters (n={len(selected_df)})")
+            ax.set_title(f"{reduction_label} colored by clusters (n={len(selected_df)})")
             handles = [
                 Line2D(
                     [0],
@@ -5739,8 +6078,18 @@ class FlowDataApp:
                                 va="center",
                                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
                             )
-        ax.set_xlabel("UMAP-1")
-        ax.set_ylabel("UMAP-2")
+
+        axis_labels = {
+            "umap": ("UMAP-1", "UMAP-2"),
+            "pca": ("PC1", "PC2"),
+            "ica": ("IC1", "IC2"),
+            "phate": ("PHATE-1", "PHATE-2"),
+        }
+        x_label, y_label = axis_labels.get(
+            reduction_method.lower(), ("Component 1", "Component 2")
+        )
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
         ax.set_xticks([])
         ax.set_yticks([])
         self._finalize_figure_layout(self.clustering_umap_fig)
@@ -6224,6 +6573,9 @@ class FlowDataApp:
         self.pending_clustering_labels = {}
 
         self._update_clustering_visual_controls()
+        self.clustering_reduction_status_var.set(
+            "Select a reduction method and click Run reduction."
+        )
 
         if errors:
             messagebox.showwarning(
@@ -6553,6 +6905,14 @@ class FlowDataApp:
         profile.is_numeric = True
         return True
 
+    def _hash_feature_matrix(self, matrix: np.ndarray) -> str:
+        contiguous = np.ascontiguousarray(matrix)
+        digest = hashlib.sha1()
+        digest.update(int(contiguous.shape[0]).to_bytes(8, "little"))
+        digest.update(int(contiguous.shape[1]).to_bytes(8, "little"))
+        digest.update(contiguous.view(np.uint8).tobytes())
+        return digest.hexdigest()
+
     def _combined_dataframe(self, required_columns: Optional[List[str]] = None) -> pd.DataFrame:
         if not self.data_files:
             raise ValueError("No data available.")
@@ -6755,7 +7115,12 @@ class FlowDataApp:
         self.clustering_features_used = []
         self.clustering_dataset_cache = None
         self.clustering_feature_matrix = None
+        self.clustering_feature_signature = None
         self.clustering_umap_cache.clear()
+        self.reduction_runner.neighbor_cache.clear()
+        self.clustering_reduction_status_var.set(
+            "Select a clustering run to compute embeddings."
+        )
         self.clustering_metadata = {}
         self.clustering_run_metadata_base = {}
         self.clustering_method_labels = dict(self.base_clustering_method_labels)
@@ -7000,6 +7365,9 @@ class FlowDataApp:
         self.clustering_features_used = list(required_columns)
         self.clustering_dataset_cache = dataset.copy()
         self.clustering_feature_matrix = features_scaled.copy()
+        self.clustering_feature_signature = self._hash_feature_matrix(
+            self.clustering_feature_matrix
+        )
         self.clustering_umap_cache.clear()
 
         downsample_method = self.clustering_downsample_method_var.get()
