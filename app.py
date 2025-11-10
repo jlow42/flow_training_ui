@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -46,10 +46,13 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     adjusted_rand_score,
+    precision_recall_curve,
+    roc_curve,
+    auc,
 )
 from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, LabelEncoder, label_binarize
 from sklearn.pipeline import Pipeline
 try:
     from scipy import sparse  # type: ignore[import]
@@ -321,6 +324,15 @@ if torch is not None and nn is not None and TensorDataset is not None:
             labels = self.label_encoder.inverse_transform(preds)
             return labels
 
+        def predict_proba(self, X: np.ndarray) -> np.ndarray:
+            X_scaled = self.scaler.transform(X)
+            tensor = torch.from_numpy(X_scaled.astype(np.float32)).to(self.device)
+            self.model.eval()
+            with torch.no_grad():
+                logits = self.model(tensor)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+            return probs
+
         def to_cpu(self) -> None:
             self.model.to(torch.device("cpu"))
             self.device = torch.device("cpu")
@@ -393,6 +405,36 @@ class FlowDataApp:
         )
         self.training_downsample_value_label_var = tk.StringVar(value="Target size")
         self.training_downsampled_df: Optional[pd.DataFrame] = None
+
+        self.threshold_class_var = tk.StringVar(value="")
+        self.threshold_value_var = tk.StringVar(value="0.50")
+        self.threshold_summary_var = tk.StringVar(
+            value="Train a model to enable threshold controls."
+        )
+        self.threshold_status_var = tk.StringVar(
+            value="Probability-based metrics will appear after training."
+        )
+        self.threshold_state: Dict[str, object] = {
+            "thresholds": {},
+            "default_thresholds": {},
+            "classes": [],
+            "display_to_class": {},
+            "class_to_display": {},
+            "y_true": None,
+            "probabilities": None,
+            "baseline_predictions": None,
+            "roc_curves": {},
+            "pr_curves": {},
+            "last_predictions": None,
+        }
+        self.threshold_slider: Optional[ttk.Scale] = None
+        self.threshold_class_combo: Optional[ttk.Combobox] = None
+        self.curves_fig: Optional[Figure] = None
+        self.roc_ax: Optional[Axes] = None
+        self.pr_ax: Optional[Axes] = None
+        self.curves_canvas: Optional[FigureCanvasTkAgg] = None
+        self.per_class_tree: Optional[ttk.Treeview] = None
+        self._suspend_threshold_callback = False
 
         total_cpu_cores = multiprocessing.cpu_count()
         default_jobs = max(total_cpu_cores - 1, 1)
@@ -4283,6 +4325,122 @@ class FlowDataApp:
         )
         self.save_model_button.pack(side="left")
 
+        per_class_frame = ttk.LabelFrame(
+            results_tab, text="Per-class Metrics", padding=8
+        )
+        per_class_frame.pack(fill="both", expand=False, pady=(0, 12))
+
+        per_class_columns = ("class", "precision", "recall", "f1", "support", "threshold")
+        per_class_tree = ttk.Treeview(
+            per_class_frame,
+            columns=per_class_columns,
+            show="headings",
+            height=6,
+        )
+        per_class_tree.heading("class", text="Class")
+        per_class_tree.heading("precision", text="Precision")
+        per_class_tree.heading("recall", text="Recall")
+        per_class_tree.heading("f1", text="F1")
+        per_class_tree.heading("support", text="Support")
+        per_class_tree.heading("threshold", text="Threshold")
+        per_class_tree.column("class", width=140, anchor="w")
+        per_class_tree.column("precision", width=90, anchor="center")
+        per_class_tree.column("recall", width=90, anchor="center")
+        per_class_tree.column("f1", width=90, anchor="center")
+        per_class_tree.column("support", width=100, anchor="center")
+        per_class_tree.column("threshold", width=110, anchor="center")
+        per_class_tree.pack(side="left", fill="both", expand=True)
+        per_class_scroll = ttk.Scrollbar(
+            per_class_frame, orient="vertical", command=per_class_tree.yview
+        )
+        per_class_scroll.pack(side="right", fill="y")
+        per_class_tree.configure(yscrollcommand=per_class_scroll.set)
+        self.per_class_tree = per_class_tree
+
+        threshold_frame = ttk.LabelFrame(
+            results_tab, text="Threshold Explorer", padding=8
+        )
+        threshold_frame.pack(fill="both", expand=False, pady=(0, 12))
+
+        ttk.Label(
+            threshold_frame,
+            textvariable=self.threshold_status_var,
+            wraplength=700,
+            justify="left",
+        ).pack(anchor="w")
+
+        controls_row = ttk.Frame(threshold_frame)
+        controls_row.pack(fill="x", pady=(8, 4))
+        ttk.Label(controls_row, text="Class:").pack(side="left")
+        class_combo = ttk.Combobox(
+            controls_row,
+            state="disabled",
+            textvariable=self.threshold_class_var,
+            width=20,
+            values=(),
+        )
+        class_combo.pack(side="left", padx=(4, 12))
+        class_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_threshold_class_changed())
+        self.threshold_class_combo = class_combo
+        ttk.Label(controls_row, text="Minimum probability:").pack(side="left")
+
+        slider_row = ttk.Frame(threshold_frame)
+        slider_row.pack(fill="x")
+        slider = ttk.Scale(
+            slider_row,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            command=self._on_threshold_slider_changed,
+            state="disabled",
+        )
+        slider.pack(side="left", fill="x", expand=True)
+        self.threshold_slider = slider
+        ttk.Label(slider_row, textvariable=self.threshold_value_var, width=8).pack(
+            side="left", padx=(8, 0)
+        )
+
+        threshold_button_row = ttk.Frame(threshold_frame)
+        threshold_button_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(
+            threshold_button_row,
+            text="Reset thresholds",
+            command=self._reset_thresholds,
+        ).pack(side="left")
+
+        ttk.Label(
+            threshold_frame,
+            textvariable=self.threshold_summary_var,
+            wraplength=700,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        curves_frame = ttk.LabelFrame(results_tab, text="ROC & PR Curves", padding=8)
+        curves_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        curves_fig = Figure(figsize=(8, 4), dpi=100)
+        roc_ax = curves_fig.add_subplot(1, 2, 1)
+        pr_ax = curves_fig.add_subplot(1, 2, 2)
+        roc_ax.set_title("Train a model to view ROC curves")
+        roc_ax.set_xlabel("False Positive Rate")
+        roc_ax.set_ylabel("True Positive Rate")
+        pr_ax.set_title("Train a model to view PR curves")
+        pr_ax.set_xlabel("Recall")
+        pr_ax.set_ylabel("Precision")
+        curves_canvas = FigureCanvasTkAgg(curves_fig, master=curves_frame)
+        curves_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._make_canvas_responsive(curves_canvas, curves_fig, min_height=260)
+        self.curves_fig = curves_fig
+        self.roc_ax = roc_ax
+        self.pr_ax = pr_ax
+        self.curves_canvas = curves_canvas
+
+        ttk.Button(
+            curves_frame,
+            text="Save Figure…",
+            command=self._save_probability_curves_figure,
+        ).pack(anchor="e", pady=(4, 0))
+
         plots_frame = ttk.Frame(results_tab)
         plots_frame.pack(fill="both", expand=True)
 
@@ -4442,12 +4600,25 @@ class FlowDataApp:
         record = self._find_run_record(selection[0])
         if not record:
             return
+        thresholds = record.get("thresholds") or {}
+        if thresholds:
+            formatted_thresholds = []
+            for key, value in thresholds.items():
+                try:
+                    formatted_thresholds.append(f"{key}: {float(value):.2f}")
+                except (TypeError, ValueError):
+                    formatted_thresholds.append(f"{key}: -")
+            threshold_line = f"Thresholds: {', '.join(formatted_thresholds)}"
+        else:
+            threshold_line = "Thresholds: -"
+
         lines = [
             f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(record.get('timestamp', 0)))}",
             f"Model: {record.get('model_name')}",
             f"Target: {record.get('target')}",
             f"Accuracy: {record.get('accuracy'):.3f}" if isinstance(record.get('accuracy'), (int, float)) else "Accuracy: -",
             f"Macro F1: {record.get('f1_macro'):.3f}" if isinstance(record.get('f1_macro'), (int, float)) else "Macro F1: -",
+            threshold_line,
             f"Class balance: {record.get('class_balance', 'None')}",
             f"Tags: {', '.join(record.get('tags', [])) or '-'}",
             f"Notes: {record.get('notes') or '-'}",
@@ -4551,6 +4722,7 @@ class FlowDataApp:
             "tags": self._parse_tags(self.run_tags_var.get()),
             "notes": self.run_notes_var.get().strip(),
             "seed": RANDOM_STATE,
+            "thresholds": self.training_results.get("thresholds", {}),
         }
         self.run_registry.append(record)
         self._save_run_registry()
@@ -6394,6 +6566,9 @@ class FlowDataApp:
     def _save_training_visual_importance_figure(self) -> None:
         self._save_figure(self.visual_importance_fig, "feature_importance_visuals.png")
 
+    def _save_probability_curves_figure(self) -> None:
+        self._save_figure(self.curves_fig, "probability_curves.png")
+
     def _save_confusion_figure(self) -> None:
         self._save_figure(self.confusion_fig, "confusion_matrix.png")
 
@@ -6717,6 +6892,54 @@ class FlowDataApp:
         self.training_status_var.set("Training not started.")
         if hasattr(self, "cv_summary_var"):
             self.cv_summary_var.set("Train a model to view cross-validation results.")
+
+        self._clear_per_class_table()
+        self._disable_threshold_controls("Train a model to enable threshold controls.")
+
+        if hasattr(self, "roc_ax") and self.roc_ax is not None:
+            self.roc_ax.clear()
+            self.roc_ax.set_title("Train a model to view ROC curves")
+            self.roc_ax.set_xlabel("False Positive Rate")
+            self.roc_ax.set_ylabel("True Positive Rate")
+        if hasattr(self, "pr_ax") and self.pr_ax is not None:
+            self.pr_ax.clear()
+            self.pr_ax.set_title("Train a model to view PR curves")
+            self.pr_ax.set_xlabel("Recall")
+            self.pr_ax.set_ylabel("Precision")
+        if hasattr(self, "curves_canvas") and self.curves_canvas is not None:
+            self.curves_canvas.draw_idle()
+
+    def _update_model_card_artifact(self) -> None:
+        if not isinstance(self.training_results, dict) or not self.training_results:
+            return
+        metrics = self.training_results.get("metrics") or {}
+        evaluation = self.training_results.get("evaluation_details") or {}
+        card = {
+            "generated_at": time.time(),
+            "model_name": self.training_results.get("model_name"),
+            "target": self.training_results.get("target"),
+            "features": list(self.training_results.get("features", [])),
+            "metrics": {
+                "accuracy": metrics.get("accuracy"),
+                "f1_macro": metrics.get("f1_macro"),
+                "f1_weighted": metrics.get("f1_weighted"),
+                "roc_auc_macro": metrics.get("roc_auc_macro"),
+                "pr_auc_macro": metrics.get("pr_auc_macro"),
+                "per_class": metrics.get("per_class"),
+                "thresholds": self.training_results.get("thresholds", {}),
+            },
+            "data": {
+                "train_rows": self.training_results.get("train_rows"),
+                "test_rows": self.training_results.get("test_rows"),
+            },
+            "config": self.training_results.get("config"),
+            "evaluation": {
+                "roc_curves": evaluation.get("roc_curves"),
+                "pr_curves": evaluation.get("pr_curves"),
+            },
+        }
+        artifacts = self.training_results.setdefault("artifacts", {})
+        artifacts["model_card"] = card
 
         if hasattr(self, "confusion_ax"):
             self.confusion_ax.clear()
@@ -7379,23 +7602,158 @@ class FlowDataApp:
         except Exception as exc:  # noqa: BLE001
             self.training_queue.put({"status": "error", "message": str(exc)})
 
-    def _classification_metrics(self, y_true: pd.Series, y_pred: np.ndarray, class_labels: Optional[List[str]] = None) -> tuple[Dict[str, object], np.ndarray, List[str]]:
-        accuracy = accuracy_score(y_true, y_pred)
-        f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
-        f1_weighted = f1_score(y_true, y_pred, average="weighted", zero_division=0)
-        report_text = classification_report(y_true, y_pred, digits=3, zero_division=0)
-        report_dict = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
-        if class_labels is None:
-            class_labels = sorted(pd.unique(pd.Series(list(y_true) + list(y_pred))))
-        conf_matrix = confusion_matrix(y_true, y_pred, labels=class_labels)
-        metrics = {
+    def _classification_metrics(
+        self,
+        y_true: pd.Series,
+        y_pred: np.ndarray,
+        class_labels: Optional[List[object]] = None,
+        y_proba: Optional[np.ndarray] = None,
+    ) -> tuple[Dict[str, object], np.ndarray, List[object], Dict[str, object]]:
+        y_true_series = pd.Series(y_true).reset_index(drop=True)
+        y_pred_arr = np.asarray(y_pred)
+        if class_labels is not None:
+            classes = list(class_labels)
+        else:
+            combined = pd.Series(
+                np.concatenate([y_true_series.to_numpy(), y_pred_arr])
+            )
+            classes = sorted(pd.unique(combined))
+
+        accuracy = accuracy_score(y_true_series, y_pred_arr)
+        f1_macro = f1_score(y_true_series, y_pred_arr, average="macro", zero_division=0)
+        f1_weighted = f1_score(
+            y_true_series, y_pred_arr, average="weighted", zero_division=0
+        )
+        report_text = classification_report(
+            y_true_series, y_pred_arr, digits=3, zero_division=0
+        )
+        report_dict = classification_report(
+            y_true_series, y_pred_arr, output_dict=True, zero_division=0
+        )
+        conf_matrix = confusion_matrix(y_true_series, y_pred_arr, labels=classes)
+
+        per_class_metrics: List[Dict[str, object]] = []
+        for label in classes:
+            stats = report_dict.get(str(label), {})
+            per_class_metrics.append(
+                {
+                    "label": label,
+                    "precision": stats.get("precision"),
+                    "recall": stats.get("recall"),
+                    "f1": stats.get("f1-score"),
+                    "support": stats.get("support"),
+                }
+            )
+
+        roc_curves: Dict[str, Dict[str, object]] = {}
+        pr_curves: Dict[str, Dict[str, object]] = {}
+        roc_aucs: List[float] = []
+        pr_aucs: List[float] = []
+
+        if y_proba is not None and len(classes) >= 2:
+            proba_array = np.asarray(y_proba, dtype=float)
+            if proba_array.ndim == 1:
+                proba_array = np.column_stack([1.0 - proba_array, proba_array])
+            if proba_array.shape[1] == len(classes) - 1:
+                remainder = 1.0 - proba_array.sum(axis=1, keepdims=True)
+                proba_array = np.hstack([proba_array, remainder])
+            if proba_array.shape[1] == len(classes):
+                y_true_binary = label_binarize(y_true_series, classes=classes)
+                if y_true_binary.ndim == 1:
+                    y_true_binary = y_true_binary.reshape(-1, 1)
+                if y_true_binary.shape[1] == 1 and len(classes) == 2:
+                    y_true_binary = np.hstack([1 - y_true_binary, y_true_binary])
+                for idx, cls in enumerate(classes):
+                    binary_true = y_true_binary[:, idx]
+                    if np.unique(binary_true).size < 2:
+                        continue
+                    scores = proba_array[:, idx]
+                    fpr, tpr, roc_thresholds = roc_curve(binary_true, scores)
+                    precision, recall, pr_thresholds = precision_recall_curve(
+                        binary_true, scores
+                    )
+                    if fpr.size and tpr.size:
+                        roc_auc = float(auc(fpr, tpr))
+                        roc_aucs.append(roc_auc)
+                    else:
+                        roc_auc = None
+                    if recall.size and precision.size:
+                        pr_auc_val = float(auc(recall, precision))
+                        pr_aucs.append(pr_auc_val)
+                    else:
+                        pr_auc_val = None
+                    label_key = str(cls)
+                    roc_curves[label_key] = {
+                        "fpr": fpr.tolist(),
+                        "tpr": tpr.tolist(),
+                        "thresholds": roc_thresholds.tolist(),
+                        "auc": roc_auc,
+                    }
+                    pr_curves[label_key] = {
+                        "precision": precision.tolist(),
+                        "recall": recall.tolist(),
+                        "thresholds": pr_thresholds.tolist(),
+                        "auc": pr_auc_val,
+                    }
+
+        metrics: Dict[str, object] = {
             "accuracy": accuracy,
             "f1_macro": f1_macro,
             "f1_weighted": f1_weighted,
             "report_text": report_text,
             "report_dict": report_dict,
+            "per_class": per_class_metrics,
         }
-        return metrics, conf_matrix, class_labels
+        if roc_aucs:
+            metrics["roc_auc_macro"] = float(np.mean(roc_aucs))
+        if pr_aucs:
+            metrics["pr_auc_macro"] = float(np.mean(pr_aucs))
+
+        evaluation_details: Dict[str, object] = {
+            "y_true": y_true_series.to_numpy(),
+            "predictions": y_pred_arr,
+            "classes": classes,
+            "probabilities": np.asarray(y_proba) if y_proba is not None else None,
+            "roc_curves": roc_curves,
+            "pr_curves": pr_curves,
+            "default_thresholds": {cls: 0.5 for cls in classes}
+            if y_proba is not None
+            else {},
+            "baseline_predictions": y_pred_arr,
+        }
+
+        return metrics, conf_matrix, classes, evaluation_details
+
+    @staticmethod
+    def _safe_predict_proba(estimator, X) -> Optional[np.ndarray]:
+        try:
+            if hasattr(estimator, "predict_proba"):
+                proba = estimator.predict_proba(X)
+            elif hasattr(estimator, "decision_function"):
+                scores = estimator.decision_function(X)
+                scores_array = np.asarray(scores, dtype=float)
+                if scores_array.ndim == 1:
+                    prob_pos = 1.0 / (1.0 + np.exp(-scores_array))
+                    proba = np.column_stack([1.0 - prob_pos, prob_pos])
+                else:
+                    shifted = scores_array - scores_array.max(axis=1, keepdims=True)
+                    exp_scores = np.exp(shifted)
+                    proba = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+            else:
+                return None
+        except Exception:
+            return None
+        proba_array = np.asarray(proba, dtype=float)
+        if proba_array.ndim == 1:
+            proba_array = np.column_stack([1.0 - proba_array, proba_array])
+        return np.clip(proba_array, 0.0, 1.0)
+
+    @staticmethod
+    def _lookup_threshold_value(thresholds: Dict[object, float], label: object) -> Optional[float]:
+        if label in thresholds:
+            return thresholds[label]
+        label_str = str(label)
+        return thresholds.get(label_str)
 
     def _perform_cross_validation(self, estimator, X_train, y_train, cv_folds: int, n_jobs: int) -> tuple[Optional[np.ndarray], str]:
         if cv_folds < 2 or len(y_train) < cv_folds:
@@ -7439,7 +7797,11 @@ class FlowDataApp:
             fit_kwargs["sample_weight"] = sample_weight
         model.fit(X_train, y_train, **fit_kwargs)
         predictions = model.predict(X_test)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions, list(model.classes_))
+        probabilities = self._safe_predict_proba(model, X_test)
+        metrics, conf_matrix, classes, evaluation_details = self._classification_metrics(
+            y_test, predictions, list(model.classes_), probabilities
+        )
+        metrics["thresholds"] = evaluation_details.get("default_thresholds", {})
         cv_scores, cv_warning = self._perform_cross_validation(
             RandomForestClassifier(
                 n_estimators=params["n_estimators"],
@@ -7466,6 +7828,8 @@ class FlowDataApp:
             "cv_scores": cv_scores,
             "cv_warning": cv_warning,
             "artifacts": {},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     def _train_lda_model(
@@ -7489,7 +7853,12 @@ class FlowDataApp:
             fit_kwargs["lda__sample_weight"] = sample_weight
         model.fit(X_train, y_train, **fit_kwargs)
         predictions = model.predict(X_test)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
+        probabilities = self._safe_predict_proba(model, X_test)
+        class_list = list(model.classes_) if hasattr(model, "classes_") else None
+        metrics, conf_matrix, classes, evaluation_details = self._classification_metrics(
+            y_test, predictions, class_list, probabilities
+        )
+        metrics["thresholds"] = evaluation_details.get("default_thresholds", {})
         cv_scores, cv_warning = self._perform_cross_validation(model, X_train, y_train, cv_folds, n_jobs)
         return {
             "model": model,
@@ -7502,6 +7871,8 @@ class FlowDataApp:
             "cv_scores": cv_scores,
             "cv_warning": cv_warning,
             "artifacts": {},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     def _train_svm_model(
@@ -7522,6 +7893,7 @@ class FlowDataApp:
             gamma=params["gamma"],
             degree=params["degree"],
             class_weight=class_weights,
+            probability=True,
         )
         model = Pipeline([
             ("scaler", StandardScaler()),
@@ -7532,7 +7904,12 @@ class FlowDataApp:
             fit_kwargs["svm__sample_weight"] = sample_weight
         model.fit(X_train, y_train, **fit_kwargs)
         predictions = model.predict(X_test)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
+        probabilities = self._safe_predict_proba(model, X_test)
+        class_list = list(model.classes_) if hasattr(model, "classes_") else None
+        metrics, conf_matrix, classes, evaluation_details = self._classification_metrics(
+            y_test, predictions, class_list, probabilities
+        )
+        metrics["thresholds"] = evaluation_details.get("default_thresholds", {})
         cv_scores, cv_warning = self._perform_cross_validation(model, X_train, y_train, cv_folds, n_jobs)
         return {
             "model": model,
@@ -7545,6 +7922,8 @@ class FlowDataApp:
             "cv_scores": cv_scores,
             "cv_warning": cv_warning,
             "artifacts": {},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     def _train_logistic_regression_model(
@@ -7581,7 +7960,11 @@ class FlowDataApp:
             fit_kwargs["logreg__sample_weight"] = sample_weight
         model.fit(X_train, y_train, **fit_kwargs)
         predictions = model.predict(X_test)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
+        probabilities = self._safe_predict_proba(model, X_test)
+        class_list = list(model.classes_) if hasattr(model, "classes_") else None
+        metrics, conf_matrix, classes, evaluation_details = self._classification_metrics(
+            y_test, predictions, class_list, probabilities
+        )
         cv_scores, cv_warning = self._perform_cross_validation(model, X_train, y_train, cv_folds, n_jobs)
         return {
             "model": model,
@@ -7594,6 +7977,8 @@ class FlowDataApp:
             "cv_scores": cv_scores,
             "cv_warning": cv_warning,
             "artifacts": {},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     def _train_naive_bayes_model(
@@ -7611,7 +7996,12 @@ class FlowDataApp:
             fit_kwargs["sample_weight"] = sample_weight
         model.fit(X_train, y_train, **fit_kwargs)
         predictions = model.predict(X_test)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
+        probabilities = self._safe_predict_proba(model, X_test)
+        class_list = list(model.classes_) if hasattr(model, "classes_") else None
+        metrics, conf_matrix, classes, evaluation_details = self._classification_metrics(
+            y_test, predictions, class_list, probabilities
+        )
+        metrics["thresholds"] = evaluation_details.get("default_thresholds", {})
         return {
             "model": model,
             "metrics": metrics,
@@ -7623,6 +8013,8 @@ class FlowDataApp:
             "cv_scores": None,
             "cv_warning": "",
             "artifacts": {},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     def _train_xgboost_model(
@@ -7656,7 +8048,12 @@ class FlowDataApp:
         )
         model.fit(X_train_np, y_train, sample_weight=sample_weight)
         predictions = model.predict(X_test_np)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
+        probabilities = self._safe_predict_proba(model, X_test_np)
+        class_list = list(model.classes_) if hasattr(model, "classes_") else None
+        metrics, conf_matrix, classes, evaluation_details = self._classification_metrics(
+            y_test, predictions, class_list, probabilities
+        )
+        metrics["thresholds"] = evaluation_details.get("default_thresholds", {})
         feature_importances = list(model.feature_importances_.tolist()) if hasattr(model, "feature_importances_") else []
         return {
             "model": model,
@@ -7669,6 +8066,8 @@ class FlowDataApp:
             "cv_scores": None,
             "cv_warning": "",
             "artifacts": {},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     def _train_lightgbm_model(
@@ -7698,7 +8097,12 @@ class FlowDataApp:
         )
         model.fit(X_train_np, y_train, sample_weight=sample_weight)
         predictions = model.predict(X_test_np)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
+        probabilities = self._safe_predict_proba(model, X_test_np)
+        class_list = list(model.classes_) if hasattr(model, "classes_") else None
+        metrics, conf_matrix, classes, evaluation_details = self._classification_metrics(
+            y_test, predictions, class_list, probabilities
+        )
+        metrics["thresholds"] = evaluation_details.get("default_thresholds", {})
         feature_importances = list(model.feature_importances_.tolist()) if hasattr(model, "feature_importances_") else []
         return {
             "model": model,
@@ -7711,6 +8115,8 @@ class FlowDataApp:
             "cv_scores": None,
             "cv_warning": "",
             "artifacts": {},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     def _build_cluster_label_map(self, clusters: np.ndarray, labels: pd.Series) -> tuple[Dict[int, object], object]:
@@ -7742,7 +8148,10 @@ class FlowDataApp:
         cluster_map, fallback = self._build_cluster_label_map(train_clusters, y_train.reset_index(drop=True))
         test_clusters = model.predict(X_test_scaled)
         predictions = np.array([cluster_map.get(cluster, fallback) for cluster in test_clusters])
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
+        metrics, conf_matrix, classes, evaluation_details = self._classification_metrics(
+            y_test, predictions
+        )
+        metrics["thresholds"] = evaluation_details.get("default_thresholds", {})
         ari = adjusted_rand_score(y_test, predictions)
         metrics.setdefault("extra_lines", []).append(f"Adjusted Rand Index: {ari:.3f}")
         metrics["extra_status"] = f"Adjusted Rand: {ari:.3f}."
@@ -7757,6 +8166,8 @@ class FlowDataApp:
             "cv_scores": None,
             "cv_warning": "",
             "artifacts": {"scaler": scaler, "cluster_label_map": cluster_map},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     def _select_torch_device(self, prefer_gpu: bool) -> str:
@@ -7800,8 +8211,13 @@ class FlowDataApp:
         )
         classifier.fit(X_train_np, y_train.to_numpy())
         predictions = classifier.predict(X_test_np)
+        probabilities = classifier.predict_proba(X_test_np)
         classifier.to_cpu()
-        metrics, conf_matrix, class_labels = self._classification_metrics(y_test, predictions)
+        class_list = list(getattr(classifier, "classes_", [])) or None
+        metrics, conf_matrix, class_labels, evaluation_details = self._classification_metrics(
+            y_test, predictions, class_list, probabilities
+        )
+        metrics["thresholds"] = evaluation_details.get("default_thresholds", {})
         return {
             "model": classifier,
             "metrics": metrics,
@@ -7813,6 +8229,8 @@ class FlowDataApp:
             "cv_scores": None,
             "cv_warning": "",
             "artifacts": {},
+            "evaluation_details": evaluation_details,
+            "thresholds": evaluation_details.get("default_thresholds", {}),
         }
 
     @staticmethod
@@ -7882,6 +8300,9 @@ class FlowDataApp:
         self._update_metrics_display(payload)
         self._update_confusion_matrix_plot(payload)
         self._update_importance_plot(payload)
+        self._update_probability_curves(payload)
+        self._initialize_threshold_controls(payload)
+        self._update_model_card_artifact()
         self.save_model_button.configure(state="normal")
         self._record_training_run(payload)
 
@@ -7891,6 +8312,391 @@ class FlowDataApp:
         self.train_button.configure(state="normal")
         self.training_status_var.set(f"Training failed: {message}")
         messagebox.showerror("Training error", message)
+
+    def _clear_per_class_table(self) -> None:
+        if not hasattr(self, "per_class_tree") or self.per_class_tree is None:
+            return
+        self.per_class_tree.delete(*self.per_class_tree.get_children())
+
+    def _update_per_class_table(
+        self,
+        metrics: Optional[Dict[str, object]],
+        thresholds: Optional[Dict[object, float]] = None,
+    ) -> None:
+        if not hasattr(self, "per_class_tree") or self.per_class_tree is None:
+            return
+        self._clear_per_class_table()
+        if not isinstance(metrics, dict):
+            return
+        per_class = metrics.get("per_class")
+        if not per_class:
+            return
+        threshold_map = dict(thresholds or {})
+        for entry in per_class:
+            label = entry.get("label")
+            display_label = str(label)
+            precision = entry.get("precision")
+            recall = entry.get("recall")
+            f1_score_val = entry.get("f1")
+            support = entry.get("support")
+            threshold_val = self._lookup_threshold_value(threshold_map, label)
+            values = (
+                display_label,
+                f"{precision:.3f}" if isinstance(precision, (int, float)) else "-",
+                f"{recall:.3f}" if isinstance(recall, (int, float)) else "-",
+                f"{f1_score_val:.3f}" if isinstance(f1_score_val, (int, float)) else "-",
+                f"{int(support)}" if isinstance(support, (int, float)) else "-",
+                f"{threshold_val:.2f}" if isinstance(threshold_val, (int, float)) else "-",
+            )
+            self.per_class_tree.insert("", "end", values=values)
+
+    def _disable_threshold_controls(self, message: str) -> None:
+        self.threshold_state = {
+            "thresholds": {},
+            "default_thresholds": {},
+            "classes": [],
+            "display_to_class": {},
+            "class_to_display": {},
+            "y_true": None,
+            "probabilities": None,
+            "baseline_predictions": None,
+            "roc_curves": {},
+            "pr_curves": {},
+            "last_predictions": None,
+        }
+        if hasattr(self, "threshold_class_combo") and self.threshold_class_combo is not None:
+            self.threshold_class_combo.configure(values=(), state="disabled")
+        self.threshold_class_var.set("")
+        if hasattr(self, "threshold_slider") and self.threshold_slider is not None:
+            self.threshold_slider.configure(state="disabled")
+        if hasattr(self, "threshold_value_var") and self.threshold_value_var is not None:
+            self.threshold_value_var.set("0.50")
+        if hasattr(self, "threshold_status_var") and self.threshold_status_var is not None:
+            self.threshold_status_var.set(message)
+        if hasattr(self, "threshold_summary_var") and self.threshold_summary_var is not None:
+            self.threshold_summary_var.set(message)
+
+    def _initialize_threshold_controls(self, payload: Dict[str, object]) -> None:
+        if not hasattr(self, "threshold_class_combo") or self.threshold_class_combo is None:
+            return
+        evaluation = payload.get("evaluation_details") or {}
+        probabilities = evaluation.get("probabilities")
+        classes = list(evaluation.get("classes") or payload.get("classes") or [])
+        if probabilities is None or not classes:
+            self._disable_threshold_controls(
+                "Threshold controls require probability outputs from the model."
+            )
+            return
+        default_raw = evaluation.get("default_thresholds") or {}
+        thresholds_raw = payload.get("thresholds") or default_raw
+        thresholds: Dict[object, float] = {}
+        defaults: Dict[object, float] = {}
+        for cls in classes:
+            default_value = self._lookup_threshold_value(default_raw, cls) or 0.5
+            actual_value = self._lookup_threshold_value(thresholds_raw, cls)
+            thresholds[cls] = float(actual_value if isinstance(actual_value, (int, float)) else default_value)
+            defaults[cls] = float(default_value)
+
+        y_true = evaluation.get("y_true")
+        y_true_array = np.asarray(y_true) if y_true is not None else None
+        baseline_predictions = evaluation.get("baseline_predictions")
+        baseline_array = (
+            np.asarray(baseline_predictions)
+            if baseline_predictions is not None
+            else None
+        )
+        probabilities_array = np.asarray(probabilities, dtype=float)
+        roc_curves = evaluation.get("roc_curves", {})
+        pr_curves = evaluation.get("pr_curves", {})
+
+        display_labels = [str(cls) for cls in classes]
+        display_to_class = dict(zip(display_labels, classes))
+        class_to_display = dict(zip(classes, display_labels))
+
+        self.threshold_state = {
+            "thresholds": thresholds,
+            "default_thresholds": defaults,
+            "classes": classes,
+            "display_to_class": display_to_class,
+            "class_to_display": class_to_display,
+            "y_true": y_true_array,
+            "probabilities": probabilities_array,
+            "baseline_predictions": baseline_array,
+            "roc_curves": roc_curves,
+            "pr_curves": pr_curves,
+            "last_predictions": baseline_array,
+        }
+
+        self.threshold_class_combo.configure(values=display_labels, state="readonly")
+        if display_labels:
+            current = self.threshold_class_var.get()
+            if current not in display_labels:
+                self.threshold_class_var.set(display_labels[0])
+            selected_class = display_to_class.get(self.threshold_class_var.get())
+            threshold_value = thresholds.get(selected_class, 0.5) if selected_class is not None else 0.5
+            self._set_threshold_slider_value(float(threshold_value))
+            self.threshold_slider.configure(state="normal")
+            if hasattr(self, "threshold_status_var") and self.threshold_status_var is not None:
+                self.threshold_status_var.set(
+                    f"Adjust threshold for class '{self.threshold_class_var.get()}'."
+                )
+        else:
+            self._set_threshold_slider_value(0.5)
+            self.threshold_slider.configure(state="disabled")
+        self.training_results.setdefault("thresholds", {})
+        self.training_results["thresholds"] = {cls: thresholds.get(cls, 0.5) for cls in classes}
+        self._update_threshold_summary()
+
+    def _set_threshold_slider_value(self, value: float) -> None:
+        if not hasattr(self, "threshold_slider") or self.threshold_slider is None:
+            return
+        clamped = max(0.0, min(1.0, float(value)))
+        self._suspend_threshold_callback = True
+        self.threshold_slider.set(clamped * 100.0)
+        if hasattr(self, "threshold_value_var") and self.threshold_value_var is not None:
+            self.threshold_value_var.set(f"{clamped:.2f}")
+        self._suspend_threshold_callback = False
+
+    def _on_threshold_class_changed(self) -> None:
+        state = self.threshold_state
+        if not state.get("classes"):
+            return
+        selected_label = self.threshold_class_var.get()
+        selected_class = state.get("display_to_class", {}).get(selected_label)
+        if selected_class is None:
+            return
+        threshold_value = state.get("thresholds", {}).get(
+            selected_class,
+            state.get("default_thresholds", {}).get(selected_class, 0.5),
+        )
+        self._set_threshold_slider_value(float(threshold_value))
+        if hasattr(self, "threshold_status_var") and self.threshold_status_var is not None:
+            self.threshold_status_var.set(
+                f"Adjust threshold for class '{selected_label}'."
+            )
+
+    def _on_threshold_slider_changed(self, raw_value: str) -> None:
+        if self._suspend_threshold_callback:
+            return
+        state = self.threshold_state
+        if not state.get("classes"):
+            return
+        selected_label = self.threshold_class_var.get()
+        selected_class = state.get("display_to_class", {}).get(selected_label)
+        if selected_class is None:
+            return
+        try:
+            slider_value = float(raw_value) / 100.0
+        except (TypeError, ValueError):
+            slider_value = 0.5
+        slider_value = max(0.0, min(1.0, slider_value))
+        if hasattr(self, "threshold_value_var") and self.threshold_value_var is not None:
+            self.threshold_value_var.set(f"{slider_value:.2f}")
+        thresholds = dict(state.get("thresholds", {}))
+        thresholds[selected_class] = slider_value
+        state["thresholds"] = thresholds
+        self.training_results.setdefault("thresholds", {})
+        self.training_results["thresholds"] = {
+            cls: thresholds.get(cls, thresholds.get(str(cls), 0.5))
+            for cls in state.get("classes", [])
+        }
+        self._update_threshold_summary()
+        self._apply_threshold_changes()
+
+    def _predict_with_thresholds(
+        self,
+        probabilities: np.ndarray,
+        classes: Sequence[object],
+        thresholds: Dict[object, float],
+        baseline_predictions: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        classes_list = list(classes)
+        if baseline_predictions is None:
+            baseline_predictions = np.array(
+                [classes_list[int(idx)] for idx in np.argmax(probabilities, axis=1)]
+            )
+        predictions: List[object] = []
+        for prob_row, baseline in zip(probabilities, baseline_predictions):
+            best_idx = int(np.argmax(prob_row))
+            best_class = classes_list[best_idx]
+            best_threshold = self._lookup_threshold_value(thresholds, best_class) or 0.0
+            if prob_row[best_idx] >= best_threshold:
+                predictions.append(best_class)
+                continue
+            chosen = None
+            for idx in np.argsort(prob_row)[::-1]:
+                label = classes_list[int(idx)]
+                threshold_val = self._lookup_threshold_value(thresholds, label) or 0.0
+                if prob_row[int(idx)] >= threshold_val:
+                    chosen = label
+                    break
+            predictions.append(chosen if chosen is not None else baseline)
+        return np.asarray(predictions)
+
+    def _apply_threshold_changes(self) -> None:
+        state = self.threshold_state
+        probabilities = state.get("probabilities")
+        y_true = state.get("y_true")
+        classes = state.get("classes") or []
+        if probabilities is None or y_true is None or not classes:
+            return
+        thresholds = state.get("thresholds", {})
+        baseline_predictions = state.get("baseline_predictions")
+        baseline_array = (
+            np.asarray(baseline_predictions)
+            if baseline_predictions is not None
+            else None
+        )
+        predictions = self._predict_with_thresholds(
+            np.asarray(probabilities, dtype=float),
+            classes,
+            thresholds,
+            baseline_array,
+        )
+        metrics, conf_matrix, _, evaluation_details = self._classification_metrics(
+            pd.Series(y_true),
+            predictions,
+            classes,
+            np.asarray(probabilities, dtype=float),
+        )
+        metrics["thresholds"] = {
+            cls: self._lookup_threshold_value(thresholds, cls) or 0.0 for cls in classes
+        }
+        existing_baseline = evaluation_details.get("baseline_predictions")
+        baseline_to_store = (
+            baseline_array if baseline_array is not None else existing_baseline
+        )
+        evaluation_details.update(
+            {
+                "probabilities": np.asarray(probabilities, dtype=float),
+                "y_true": np.asarray(y_true),
+                "baseline_predictions": baseline_to_store,
+                "adjusted_predictions": predictions,
+                "classes": classes,
+                "roc_curves": state.get("roc_curves", evaluation_details.get("roc_curves", {})),
+                "pr_curves": state.get("pr_curves", evaluation_details.get("pr_curves", {})),
+                "default_thresholds": state.get(
+                    "default_thresholds", evaluation_details.get("default_thresholds", {})
+                ),
+            }
+        )
+        state["roc_curves"] = evaluation_details.get("roc_curves", {})
+        state["pr_curves"] = evaluation_details.get("pr_curves", {})
+        state["last_predictions"] = predictions
+
+        self.training_results["metrics"] = metrics
+        self.training_results["confusion_matrix"] = conf_matrix
+        self.training_results["classes"] = classes
+        self.training_results["evaluation_details"] = evaluation_details
+        self.training_results["thresholds"] = metrics.get("thresholds", {})
+
+        self._update_metrics_display(self.training_results)
+        self._update_confusion_matrix_plot(self.training_results)
+        self._update_probability_curves(self.training_results)
+        self._update_threshold_summary()
+        self._update_model_card_artifact()
+
+    def _reset_thresholds(self) -> None:
+        defaults = self.threshold_state.get("default_thresholds") or {}
+        if not defaults:
+            return
+        thresholds = {
+            cls: defaults.get(cls, defaults.get(str(cls), 0.5))
+            for cls in self.threshold_state.get("classes", [])
+        }
+        self.threshold_state["thresholds"] = thresholds
+        selected_label = self.threshold_class_var.get()
+        selected_class = self.threshold_state.get("display_to_class", {}).get(selected_label)
+        value = thresholds.get(selected_class, 0.5) if selected_class is not None else 0.5
+        self._set_threshold_slider_value(float(value))
+        if hasattr(self, "threshold_status_var") and self.threshold_status_var is not None:
+            self.threshold_status_var.set("Thresholds reset to defaults.")
+        self.training_results["thresholds"] = thresholds
+        self._apply_threshold_changes()
+
+    def _update_threshold_summary(self) -> None:
+        if not hasattr(self, "threshold_summary_var") or self.threshold_summary_var is None:
+            return
+        if not isinstance(self.training_results, dict) or not self.training_results:
+            self.threshold_summary_var.set("Train a model to enable threshold controls.")
+            return
+        metrics = self.training_results.get("metrics")
+        thresholds = self.training_results.get("thresholds") or {}
+        if not isinstance(metrics, dict) or not thresholds:
+            self.threshold_summary_var.set("Adjust thresholds to recompute metrics.")
+            return
+        accuracy = metrics.get("accuracy")
+        f1_macro = metrics.get("f1_macro")
+        threshold_items = []
+        for cls, value in thresholds.items():
+            try:
+                threshold_items.append(f"{cls}: {float(value):.2f}")
+            except (TypeError, ValueError):
+                threshold_items.append(f"{cls}: -")
+        accuracy_str = f"{accuracy:.3f}" if isinstance(accuracy, (int, float)) else "-"
+        f1_str = f"{f1_macro:.3f}" if isinstance(f1_macro, (int, float)) else "-"
+        threshold_str = ", ".join(threshold_items) if threshold_items else "-"
+        self.threshold_summary_var.set(
+            f"Thresholds — {threshold_str}. Accuracy: {accuracy_str}, Macro F1: {f1_str}."
+        )
+
+    def _update_probability_curves(self, payload: Dict[str, object]) -> None:
+        if not hasattr(self, "roc_ax") or self.roc_ax is None or self.pr_ax is None:
+            return
+        evaluation = payload.get("evaluation_details") or {}
+        roc_curves = evaluation.get("roc_curves") or {}
+        pr_curves = evaluation.get("pr_curves") or {}
+
+        self.roc_ax.clear()
+        self.pr_ax.clear()
+
+        if roc_curves:
+            for label, curve in roc_curves.items():
+                fpr = np.asarray(curve.get("fpr", []), dtype=float)
+                tpr = np.asarray(curve.get("tpr", []), dtype=float)
+                if fpr.size == 0 or tpr.size == 0:
+                    continue
+                auc_val = curve.get("auc")
+                legend = str(label)
+                if isinstance(auc_val, (int, float)):
+                    legend = f"{legend} (AUC={auc_val:.3f})"
+                self.roc_ax.plot(fpr, tpr, label=legend)
+            self.roc_ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=0.8)
+            self.roc_ax.set_xlabel("False Positive Rate")
+            self.roc_ax.set_ylabel("True Positive Rate")
+            self.roc_ax.set_title("ROC Curve")
+            if self.roc_ax.lines:
+                self.roc_ax.legend(loc="lower right", fontsize=8)
+        else:
+            self.roc_ax.set_title("ROC curves unavailable")
+            self.roc_ax.set_xlabel("False Positive Rate")
+            self.roc_ax.set_ylabel("True Positive Rate")
+
+        if pr_curves:
+            for label, curve in pr_curves.items():
+                precision = np.asarray(curve.get("precision", []), dtype=float)
+                recall = np.asarray(curve.get("recall", []), dtype=float)
+                if precision.size == 0 or recall.size == 0:
+                    continue
+                auc_val = curve.get("auc")
+                legend = str(label)
+                if isinstance(auc_val, (int, float)):
+                    legend = f"{legend} (AUC={auc_val:.3f})"
+                self.pr_ax.plot(recall, precision, label=legend)
+            self.pr_ax.set_xlabel("Recall")
+            self.pr_ax.set_ylabel("Precision")
+            self.pr_ax.set_title("Precision-Recall Curve")
+            if self.pr_ax.lines:
+                self.pr_ax.legend(loc="lower left", fontsize=8)
+        else:
+            self.pr_ax.set_title("Precision-Recall curves unavailable")
+            self.pr_ax.set_xlabel("Recall")
+            self.pr_ax.set_ylabel("Precision")
+
+        if hasattr(self, "curves_fig") and self.curves_fig is not None:
+            self._finalize_figure_layout(self.curves_fig)
+        if hasattr(self, "curves_canvas") and self.curves_canvas is not None:
+            self.curves_canvas.draw_idle()
 
     def _update_metrics_display(self, payload: Dict[str, object]) -> None:
         if not hasattr(self, "metrics_text"):
@@ -7921,6 +8727,10 @@ class FlowDataApp:
         self.metrics_text.delete("1.0", tk.END)
         self.metrics_text.insert("1.0", "\n".join(summary_lines))
         self.metrics_text.configure(state="disabled")
+
+        thresholds = payload.get("thresholds", {})
+        self._update_per_class_table(metrics, thresholds)
+        self._update_threshold_summary()
 
     def _update_confusion_matrix_plot(self, payload: Dict[str, object]) -> None:
         if not hasattr(self, "confusion_ax"):
@@ -8040,6 +8850,8 @@ class FlowDataApp:
             "artifacts": self.training_results.get("artifacts", {}),
             "config": self.training_results.get("config", {}),
             "training_time": self.training_results.get("training_time"),
+            "evaluation_details": self.training_results.get("evaluation_details"),
+            "thresholds": self.training_results.get("thresholds", {}),
             "timestamp": time.time(),
             "save_options": save_options,
         }
