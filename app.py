@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -48,6 +48,7 @@ from sklearn.metrics import (
     adjusted_rand_score,
 )
 from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.inspection import permutation_importance, partial_dependence
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.pipeline import Pipeline
@@ -92,6 +93,11 @@ except ImportError:
     umap = None  # type: ignore[assignment]
 
 try:
+    import shap  # type: ignore[import]
+except ImportError:
+    shap = None  # type: ignore[assignment]
+
+try:
     import torch  # type: ignore[import]
     from torch import nn  # type: ignore[import]
     from torch.utils.data import DataLoader, TensorDataset  # type: ignore[import]
@@ -108,6 +114,10 @@ MAX_CLUSTER_COMPARE_CATEGORIES = 30
 CSV_METADATA_SAMPLE_ROWS = 5000
 DEFAULT_CSV_CHUNKSIZE = 200_000
 IS_DARWIN = sys.platform == "darwin"
+EXPLAIN_MAX_SAMPLE_ROWS = 256
+EXPLAIN_BACKGROUND_ROWS = 256
+EXPLAIN_PERMUTATION_REPEATS = 5
+PDP_GRID_RESOLUTION = 20
 
 
 class ScrollableFrame(ttk.Frame):
@@ -453,6 +463,31 @@ class FlowDataApp:
         self.keep_rf_oob_var = tk.BooleanVar(value=True)
         self.training_model_description_var = tk.StringVar(value="")
         self.class_balance_var.trace_add("write", lambda *_: self._mark_session_dirty())
+
+        # Explainability state
+        self.explain_permutation_data: List[Dict[str, float]] = []
+        self.explain_shap_summary: List[Dict[str, float]] = []
+        self.explain_shap_samples: List[Dict[str, object]] = []
+        self.explain_shap_expected: Optional[float] = None
+        self.explain_pdp_data: Dict[str, Dict[str, object]] = {}
+        self.explain_selected_sample_var = tk.StringVar(value="0")
+        self.explain_selected_feature_var = tk.StringVar(value="")
+        self.explain_permutation_error_var = tk.StringVar(value="")
+        self.explain_shap_error_var = tk.StringVar(value="")
+        self.explain_pdp_error_var = tk.StringVar(value="")
+        self.permutation_fig: Optional[Figure] = None
+        self.permutation_ax: Optional[Axes] = None
+        self.permutation_canvas: Optional[FigureCanvasTkAgg] = None
+        self.shap_summary_fig: Optional[Figure] = None
+        self.shap_summary_ax: Optional[Axes] = None
+        self.shap_summary_canvas: Optional[FigureCanvasTkAgg] = None
+        self.shap_force_tree: Optional[ttk.Treeview] = None
+        self.shap_sample_combo: Optional[ttk.Combobox] = None
+        self.shap_sample_label_var = tk.StringVar(value="Select a sample to inspect feature contributions.")
+        self.pdp_fig: Optional[Figure] = None
+        self.pdp_ax: Optional[Axes] = None
+        self.pdp_canvas: Optional[FigureCanvasTkAgg] = None
+        self.pdp_feature_combo: Optional[ttk.Combobox] = None
         self.training_model_configs = {
             "Random Forest": {
                 "key": "rf",
@@ -829,6 +864,7 @@ class FlowDataApp:
         self._init_training_setup_tab(training_notebook)
         self._init_training_module_tab(training_notebook)
         self._init_training_visuals_tab(training_notebook)
+        self._init_explainability_tab(training_notebook)
         self._init_results_tab(training_notebook)
         self._init_run_registry_tab(training_notebook)
 
@@ -4224,6 +4260,160 @@ class FlowDataApp:
             command=self._save_training_visual_importance_figure,
         ).pack(anchor="e", pady=(6, 0))
 
+    def _init_explainability_tab(self, notebook: ttk.Notebook) -> None:
+        explain_tab = ttk.Frame(notebook)
+        notebook.add(explain_tab, text="Explainability")
+        scroll = ScrollableFrame(explain_tab)
+        scroll.pack(fill="both", expand=True)
+        container = ttk.Frame(scroll.scrollable_frame, padding=8)
+        container.pack(fill="both", expand=True)
+
+        permutation_frame = ttk.LabelFrame(
+            container,
+            text="Permutation importance",
+            padding=8,
+        )
+        permutation_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        permutation_fig = Figure(figsize=(6, 4), dpi=100)
+        self.permutation_ax = permutation_fig.add_subplot(111)
+        self.permutation_ax.set_title("Train a model to compute permutation importance")
+        self.permutation_ax.set_xlabel("Importance (mean decrease)")
+        self.permutation_ax.set_ylabel("Feature")
+        self.permutation_canvas = FigureCanvasTkAgg(permutation_fig, master=permutation_frame)
+        self.permutation_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._make_canvas_responsive(self.permutation_canvas, permutation_fig, min_height=240)
+        self.permutation_fig = permutation_fig
+        ttk.Label(
+            permutation_frame,
+            textvariable=self.explain_permutation_error_var,
+            foreground="red",
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Button(
+            permutation_frame,
+            text="Save Figure…",
+            command=self._save_permutation_importance_figure,
+        ).pack(anchor="e", pady=(6, 0))
+
+        shap_summary_frame = ttk.LabelFrame(
+            container,
+            text="SHAP summary",
+            padding=8,
+        )
+        shap_summary_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        shap_summary_fig = Figure(figsize=(6, 4), dpi=100)
+        self.shap_summary_ax = shap_summary_fig.add_subplot(111)
+        self.shap_summary_ax.set_title("Train a model to compute SHAP values")
+        self.shap_summary_ax.set_xlabel("Mean |SHAP| value")
+        self.shap_summary_ax.set_ylabel("Feature")
+        self.shap_summary_canvas = FigureCanvasTkAgg(shap_summary_fig, master=shap_summary_frame)
+        self.shap_summary_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._make_canvas_responsive(self.shap_summary_canvas, shap_summary_fig, min_height=240)
+        self.shap_summary_fig = shap_summary_fig
+        ttk.Label(
+            shap_summary_frame,
+            textvariable=self.explain_shap_error_var,
+            foreground="red",
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+        ttk.Button(
+            shap_summary_frame,
+            text="Save Figure…",
+            command=self._save_shap_summary_figure,
+        ).pack(anchor="e", pady=(6, 0))
+
+        shap_force_frame = ttk.LabelFrame(
+            container,
+            text="SHAP force (per-sample contributions)",
+            padding=8,
+        )
+        shap_force_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        shap_controls = ttk.Frame(shap_force_frame)
+        shap_controls.pack(fill="x", pady=(0, 6))
+        ttk.Label(shap_controls, text="Sample:").pack(side="left")
+        self.shap_sample_combo = ttk.Combobox(
+            shap_controls,
+            state="readonly",
+            textvariable=self.explain_selected_sample_var,
+            width=12,
+        )
+        self.shap_sample_combo.pack(side="left", padx=(6, 12))
+        self.shap_sample_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: self._on_shap_sample_changed(),
+        )
+        ttk.Label(
+            shap_controls,
+            textvariable=self.shap_sample_label_var,
+            wraplength=600,
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
+
+        columns = ("feature", "value", "shap")
+        self.shap_force_tree = ttk.Treeview(
+            shap_force_frame,
+            columns=columns,
+            show="headings",
+            height=8,
+        )
+        self.shap_force_tree.heading("feature", text="Feature")
+        self.shap_force_tree.heading("value", text="Feature value")
+        self.shap_force_tree.heading("shap", text="SHAP contribution")
+        self.shap_force_tree.column("feature", anchor="w", width=220)
+        self.shap_force_tree.column("value", anchor="center", width=140)
+        self.shap_force_tree.column("shap", anchor="center", width=160)
+        self.shap_force_tree.pack(fill="both", expand=True)
+
+        pdp_frame = ttk.LabelFrame(
+            container,
+            text="Partial dependence / ICE",
+            padding=8,
+        )
+        pdp_frame.pack(fill="both", expand=True, pady=(0, 12))
+
+        pdp_controls = ttk.Frame(pdp_frame)
+        pdp_controls.pack(fill="x", pady=(0, 6))
+        ttk.Label(pdp_controls, text="Feature:").pack(side="left")
+        pdp_combo = ttk.Combobox(
+            pdp_controls,
+            textvariable=self.explain_selected_feature_var,
+            state="readonly",
+            width=24,
+        )
+        pdp_combo.pack(side="left", padx=(6, 12))
+        pdp_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _evt: self._update_pdp_plot(),
+        )
+        self.pdp_feature_combo = pdp_combo
+        ttk.Label(
+            pdp_controls,
+            textvariable=self.explain_pdp_error_var,
+            foreground="red",
+            wraplength=600,
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
+
+        pdp_fig = Figure(figsize=(6, 4), dpi=100)
+        self.pdp_ax = pdp_fig.add_subplot(111)
+        self.pdp_ax.set_title("Train a model to compute partial dependence")
+        self.pdp_ax.set_xlabel("Feature value")
+        self.pdp_ax.set_ylabel("Predicted response")
+        self.pdp_canvas = FigureCanvasTkAgg(pdp_fig, master=pdp_frame)
+        self.pdp_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._make_canvas_responsive(self.pdp_canvas, pdp_fig, min_height=260)
+        self.pdp_fig = pdp_fig
+        ttk.Button(
+            pdp_frame,
+            text="Save Figure…",
+            command=self._save_pdp_figure,
+        ).pack(anchor="e", pady=(6, 0))
+
     def _init_results_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Results")
@@ -6394,6 +6584,15 @@ class FlowDataApp:
     def _save_training_visual_importance_figure(self) -> None:
         self._save_figure(self.visual_importance_fig, "feature_importance_visuals.png")
 
+    def _save_permutation_importance_figure(self) -> None:
+        self._save_figure(self.permutation_fig, "permutation_importance.png")
+
+    def _save_shap_summary_figure(self) -> None:
+        self._save_figure(self.shap_summary_fig, "shap_summary.png")
+
+    def _save_pdp_figure(self) -> None:
+        self._save_figure(self.pdp_fig, "partial_dependence.png")
+
     def _save_confusion_figure(self) -> None:
         self._save_figure(self.confusion_fig, "confusion_matrix.png")
 
@@ -6741,6 +6940,210 @@ class FlowDataApp:
 
         if hasattr(self, "save_model_button"):
             self.save_model_button.configure(state="disabled")
+
+        self._reset_explainability_views()
+
+    def _reset_explainability_views(self) -> None:
+        self.explain_permutation_data = []
+        self.explain_shap_summary = []
+        self.explain_shap_samples = []
+        self.explain_shap_expected = None
+        self.explain_pdp_data = {}
+        self.explain_permutation_error_var.set("")
+        self.explain_shap_error_var.set("")
+        self.explain_pdp_error_var.set("")
+        self.shap_sample_label_var.set("Select a sample to inspect feature contributions.")
+        if self.shap_sample_combo is not None:
+            self.shap_sample_combo["values"] = []
+            self.explain_selected_sample_var.set("0")
+        if self.shap_force_tree is not None:
+            self.shap_force_tree.delete(*self.shap_force_tree.get_children())
+        if self.pdp_feature_combo is not None:
+            self.pdp_feature_combo["values"] = []
+        self.explain_selected_feature_var.set("")
+
+        if self.permutation_ax is not None:
+            self.permutation_ax.clear()
+            self.permutation_ax.set_title("Train a model to compute permutation importance")
+            self.permutation_ax.set_xlabel("Importance (mean decrease)")
+            self.permutation_ax.set_ylabel("Feature")
+            if self.permutation_canvas is not None:
+                self.permutation_canvas.draw_idle()
+
+        if self.shap_summary_ax is not None:
+            self.shap_summary_ax.clear()
+            self.shap_summary_ax.set_title("Train a model to compute SHAP values")
+            self.shap_summary_ax.set_xlabel("Mean |SHAP| value")
+            self.shap_summary_ax.set_ylabel("Feature")
+            if self.shap_summary_canvas is not None:
+                self.shap_summary_canvas.draw_idle()
+
+        if self.pdp_ax is not None:
+            self.pdp_ax.clear()
+            self.pdp_ax.set_title("Train a model to compute partial dependence")
+            self.pdp_ax.set_xlabel("Feature value")
+            self.pdp_ax.set_ylabel("Predicted response")
+            if self.pdp_canvas is not None:
+                self.pdp_canvas.draw_idle()
+
+    def _update_explainability_views(self, explanations: Optional[Dict[str, object]]) -> None:
+        self._reset_explainability_views()
+        if not explanations:
+            return
+
+        permutation = explanations.get("permutation") if isinstance(explanations, dict) else None
+        if isinstance(permutation, dict):
+            error = permutation.get("error")
+            if error:
+                self.explain_permutation_error_var.set(str(error))
+            else:
+                results = permutation.get("results") or []
+                if isinstance(results, list) and results:
+                    self.explain_permutation_data = results
+                    self._render_permutation_importance(results)
+
+        shap_info = explanations.get("shap") if isinstance(explanations, dict) else None
+        if isinstance(shap_info, dict):
+            shap_error = shap_info.get("error")
+            if shap_error:
+                self.explain_shap_error_var.set(str(shap_error))
+            else:
+                summary = shap_info.get("summary") or []
+                samples = shap_info.get("samples") or []
+                if isinstance(summary, list) and summary:
+                    self.explain_shap_summary = summary
+                    self._render_shap_summary(summary)
+                if isinstance(samples, list) and samples:
+                    self.explain_shap_samples = samples
+                    self._populate_shap_samples(samples)
+
+        pdp_info = explanations.get("pdp") if isinstance(explanations, dict) else None
+        if isinstance(pdp_info, dict):
+            pdp_error = pdp_info.get("error")
+            if pdp_error:
+                self.explain_pdp_error_var.set(str(pdp_error))
+            features = pdp_info.get("features") or {}
+            if isinstance(features, dict) and features:
+                self.explain_pdp_data = features  # type: ignore[assignment]
+                options = list(features.keys())
+                if self.pdp_feature_combo is not None:
+                    self.pdp_feature_combo["values"] = options
+                if options:
+                    self.explain_selected_feature_var.set(options[0])
+                    self._update_pdp_plot()
+
+    def _render_permutation_importance(self, results: List[Dict[str, object]]) -> None:
+        if self.permutation_ax is None or self.permutation_canvas is None:
+            return
+        top_results = results[: min(30, len(results))]
+        features = [str(item.get("feature", "")) for item in top_results]
+        means = [float(item.get("importance_mean", 0.0)) for item in top_results]
+        stds = [float(item.get("importance_std", 0.0)) for item in top_results]
+        indices = np.arange(len(features))
+        self.permutation_ax.clear()
+        self.permutation_ax.barh(indices, means, xerr=stds, color="#4c72b0", alpha=0.85)
+        self.permutation_ax.set_yticks(indices)
+        self.permutation_ax.set_yticklabels(features)
+        self.permutation_ax.invert_yaxis()
+        self.permutation_ax.set_xlabel("Importance (mean decrease)")
+        self.permutation_ax.set_title("Permutation importance")
+        self.permutation_canvas.draw_idle()
+
+    def _render_shap_summary(self, summary: List[Dict[str, object]]) -> None:
+        if self.shap_summary_ax is None or self.shap_summary_canvas is None:
+            return
+        top_summary = summary[: min(30, len(summary))]
+        features = [str(item.get("feature", "")) for item in top_summary]
+        values = [float(item.get("mean_abs_shap", 0.0)) for item in top_summary]
+        indices = np.arange(len(features))
+        self.shap_summary_ax.clear()
+        self.shap_summary_ax.barh(indices, values, color="#dd8452", alpha=0.85)
+        self.shap_summary_ax.set_yticks(indices)
+        self.shap_summary_ax.set_yticklabels(features)
+        self.shap_summary_ax.invert_yaxis()
+        self.shap_summary_ax.set_xlabel("Mean |SHAP| value")
+        self.shap_summary_ax.set_title("SHAP summary")
+        self.shap_summary_canvas.draw_idle()
+
+    def _populate_shap_samples(self, samples: List[Dict[str, object]]) -> None:
+        if self.shap_force_tree is None:
+            return
+        options = [
+            f"{idx}: row {sample.get('source_index', idx)}"
+            for idx, sample in enumerate(samples)
+        ]
+        if self.shap_sample_combo is not None:
+            self.shap_sample_combo["values"] = options
+        if options:
+            selection = options[0]
+            self.explain_selected_sample_var.set(selection)
+            self._on_shap_sample_changed()
+
+    def _on_shap_sample_changed(self) -> None:
+        if self.shap_force_tree is None:
+            return
+        selection = self.explain_selected_sample_var.get()
+        if ":" in selection:
+            index_str = selection.split(":", 1)[0].strip()
+        else:
+            index_str = selection.strip()
+        try:
+            index = int(index_str)
+        except ValueError:
+            index = 0
+        if index < 0 or index >= len(self.explain_shap_samples):
+            return
+        sample = self.explain_shap_samples[index]
+        self.shap_force_tree.delete(*self.shap_force_tree.get_children())
+        contributions = sample.get("contributions") or []
+        for contrib in contributions[:50]:
+            values = (
+                str(contrib.get("feature", "")),
+                str(contrib.get("feature_value", "")),
+                f"{float(contrib.get('shap_value', 0.0)):.4f}",
+            )
+            self.shap_force_tree.insert("", "end", values=values)
+        prediction = sample.get("prediction", "?")
+        base_value = sample.get("base_value")
+        source_index = sample.get("source_index", index)
+        if isinstance(base_value, (float, int, np.floating, np.integer)):
+            base_display = f"{float(base_value):.4f}"
+        else:
+            base_display = str(base_value)
+        self.shap_sample_label_var.set(
+            f"Sample row {source_index} — prediction: {prediction}, base value: {base_display}"
+        )
+
+    def _update_pdp_plot(self) -> None:
+        if self.pdp_ax is None or self.pdp_canvas is None:
+            return
+        feature = self.explain_selected_feature_var.get()
+        self.pdp_ax.clear()
+        if not feature or feature not in self.explain_pdp_data:
+            self.pdp_ax.set_title("Select a feature to view PDP/ICE")
+            self.pdp_ax.set_xlabel("Feature value")
+            self.pdp_ax.set_ylabel("Predicted response")
+            self.pdp_canvas.draw_idle()
+            return
+        data = self.explain_pdp_data.get(feature) or {}
+        values = np.array(data.get("values") or [])
+        average = np.array(data.get("average") or [])
+        individuals = data.get("individual") or []
+        if values.size == 0 or average.size == 0:
+            self.pdp_ax.set_title("Partial dependence unavailable")
+            self.pdp_canvas.draw_idle()
+            return
+        for curve in individuals:
+            curve_array = np.array(curve)
+            if curve_array.size == values.size:
+                self.pdp_ax.plot(values, curve_array, color="#999999", alpha=0.25)
+        self.pdp_ax.plot(values, average, color="#4c72b0", linewidth=2.0, label="PDP")
+        self.pdp_ax.set_title(f"Partial dependence: {feature}")
+        self.pdp_ax.set_xlabel(feature)
+        self.pdp_ax.set_ylabel("Predicted response")
+        if individuals:
+            self.pdp_ax.legend(loc="best")
+        self.pdp_canvas.draw_idle()
 
     def _clear_training_state(self) -> None:
         self.trained_model = None
@@ -7207,6 +7610,7 @@ class FlowDataApp:
         }
 
         self.training_results = {}
+        self._reset_explainability_views()
         self.training_queue = queue.Queue()
         self.training_in_progress = True
         self.train_button.configure(state="disabled")
@@ -7360,6 +7764,20 @@ class FlowDataApp:
             else:
                 raise ValueError(f"Unsupported model '{model_name}'.")
 
+            model_config = self.training_model_configs.get(model_name, {})
+            if model_config.get("type") == "supervised":
+                explanations = self._compute_model_explanations(
+                    payload.get("model"),
+                    X_train,
+                    X_test,
+                    y_train,
+                    y_test,
+                    config["features"],
+                    payload.get("classes"),
+                )
+                if explanations:
+                    payload["explanations"] = explanations
+
             payload.setdefault("training_time", time.time() - start_time)
             payload.setdefault("artifacts", {})
             payload.update(
@@ -7378,6 +7796,241 @@ class FlowDataApp:
             self.training_queue.put({"status": "success", "payload": payload})
         except Exception as exc:  # noqa: BLE001
             self.training_queue.put({"status": "error", "message": str(exc)})
+
+    def _sample_dataframe(self, df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+        if max_rows <= 0:
+            return df.copy()
+        if len(df) <= max_rows:
+            return df.copy()
+        return df.sample(n=max_rows, random_state=RANDOM_STATE)
+
+    def _compute_model_explanations(
+        self,
+        model: Optional[object],
+        X_train: pd.DataFrame,
+        X_test: pd.DataFrame,
+        y_train: pd.Series,
+        y_test: pd.Series,
+        features: Sequence[str],
+        class_labels: Optional[Sequence[object]],
+    ) -> Dict[str, object]:
+        if model is None:
+            return {}
+        if X_test.empty or not features:
+            return {}
+
+        explanations: Dict[str, object] = {}
+        X_sample = self._sample_dataframe(X_test, EXPLAIN_MAX_SAMPLE_ROWS)
+        y_sample = y_test.loc[X_sample.index] if len(y_test) else y_test
+        background = self._sample_dataframe(X_train, EXPLAIN_BACKGROUND_ROWS)
+
+        explanations["permutation"] = self._compute_permutation_importance(
+            model,
+            X_sample,
+            y_sample,
+            features,
+            class_labels,
+        )
+
+        explanations["shap"] = self._compute_shap_values(
+            model,
+            background,
+            X_sample,
+            features,
+            class_labels,
+        )
+
+        explanations["pdp"] = self._compute_partial_dependence(
+            model,
+            background,
+            features,
+            explanations["shap"],
+        )
+
+        return explanations
+
+    def _compute_permutation_importance(
+        self,
+        model: object,
+        X_sample: pd.DataFrame,
+        y_sample: pd.Series,
+        features: Sequence[str],
+        class_labels: Optional[Sequence[object]],
+    ) -> Dict[str, object]:
+        result: Dict[str, object] = {"results": [], "error": ""}
+        if X_sample.empty or (y_sample is not None and len(y_sample) == 0):
+            return result
+        scoring: Optional[str]
+        if class_labels is not None and len(class_labels) > 1:
+            scoring = "f1_macro"
+        else:
+            scoring = None
+        try:
+            perm = permutation_importance(
+                model,
+                X_sample,
+                y_sample,
+                n_repeats=EXPLAIN_PERMUTATION_REPEATS,
+                random_state=RANDOM_STATE,
+                scoring=scoring,
+                n_jobs=min(self.total_cpu_cores, 8),
+            )
+            results = [
+                {
+                    "feature": feature,
+                    "importance_mean": float(perm.importances_mean[idx]),
+                    "importance_std": float(perm.importances_std[idx]),
+                }
+                for idx, feature in enumerate(features)
+            ]
+            results.sort(key=lambda item: item["importance_mean"], reverse=True)
+            result["results"] = results
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = str(exc)
+        return result
+
+    def _compute_shap_values(
+        self,
+        model: object,
+        background: pd.DataFrame,
+        X_sample: pd.DataFrame,
+        features: Sequence[str],
+        class_labels: Optional[Sequence[object]],
+    ) -> Dict[str, object]:
+        shap_result: Dict[str, object] = {
+            "summary": [],
+            "samples": [],
+            "error": "",
+        }
+        if shap is None:
+            shap_result["error"] = "SHAP is not installed. Install the 'shap' package to enable explanations."
+            return shap_result
+        if X_sample.empty or background.empty:
+            return shap_result
+        try:
+            explainer = shap.Explainer(model, background, feature_names=list(features))
+            explanation = explainer(X_sample)
+            values = np.array(explanation.values)
+            if values.ndim == 3:
+                summary_matrix = np.abs(values).mean(axis=1)
+            else:
+                summary_matrix = np.abs(values)
+            summary = summary_matrix.mean(axis=0)
+            shap_summary = [
+                {"feature": feature, "mean_abs_shap": float(summary[idx])}
+                for idx, feature in enumerate(features)
+            ]
+            shap_summary.sort(key=lambda item: item["mean_abs_shap"], reverse=True)
+            shap_result["summary"] = shap_summary
+            shap_result["samples"] = self._format_shap_samples(
+                explanation,
+                X_sample,
+                model,
+                class_labels,
+            )
+        except Exception as exc:  # noqa: BLE001
+            shap_result["error"] = str(exc)
+        return shap_result
+
+    def _format_shap_samples(
+        self,
+        explanation: "shap.Explanation",
+        X_sample: pd.DataFrame,
+        model: object,
+        class_labels: Optional[Sequence[object]],
+    ) -> List[Dict[str, object]]:
+        samples: List[Dict[str, object]] = []
+        try:
+            predictions = model.predict(X_sample)
+        except Exception:  # noqa: BLE001
+            predictions = [None] * len(X_sample)
+        for idx, (row_index, row) in enumerate(X_sample.iterrows()):
+            sample_exp = explanation[idx]
+            values = np.array(sample_exp.values)
+            base_values = np.array(sample_exp.base_values)
+            if values.ndim == 2:
+                if predictions[idx] is not None and class_labels is not None and predictions[idx] in class_labels:
+                    class_index = list(class_labels).index(predictions[idx])
+                else:
+                    class_index = 0
+                shap_vector = values[class_index]
+                base_value = float(np.atleast_1d(base_values).reshape(-1)[class_index])
+            else:
+                shap_vector = values
+                base_value = float(np.atleast_1d(base_values).reshape(-1)[0])
+            contributions = [
+                {
+                    "feature": column,
+                    "shap_value": float(shap_vector[col_idx]),
+                    "feature_value": self._format_feature_value(row.iloc[col_idx]),
+                }
+                for col_idx, column in enumerate(X_sample.columns)
+            ]
+            contributions.sort(key=lambda item: abs(item["shap_value"]), reverse=True)
+            samples.append(
+                {
+                    "row": idx,
+                    "source_index": self._format_index_value(row_index),
+                    "prediction": self._format_feature_value(predictions[idx]),
+                    "base_value": base_value,
+                    "contributions": contributions,
+                }
+            )
+        return samples
+
+    def _format_index_value(self, value: object) -> str:
+        if isinstance(value, (np.integer, int)):
+            return str(int(value))
+        return str(value)
+
+    def _format_feature_value(self, value: object) -> str:
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return "NaN"
+        if isinstance(value, float):
+            return f"{value:.4f}"
+        if isinstance(value, (np.floating,)):
+            return f"{float(value):.4f}"
+        return str(value)
+
+    def _compute_partial_dependence(
+        self,
+        model: object,
+        background: pd.DataFrame,
+        features: Sequence[str],
+        shap_result: Dict[str, object],
+    ) -> Dict[str, object]:
+        pdp_result: Dict[str, object] = {"features": {}, "error": ""}
+        if background.empty:
+            return pdp_result
+        if not features:
+            return pdp_result
+        top_features: List[str]
+        shap_summary = shap_result.get("summary") if shap_result else None
+        if isinstance(shap_summary, list) and shap_summary:
+            top_features = [item["feature"] for item in shap_summary[: min(5, len(shap_summary))]]
+        else:
+            top_features = list(features)[: min(5, len(features))]
+        try:
+            for feature in top_features:
+                pd_data = partial_dependence(
+                    model,
+                    background,
+                    [feature],
+                    kind="both",
+                    grid_resolution=PDP_GRID_RESOLUTION,
+                )
+                values = pd_data["values"][0]
+                average = pd_data["average"][0]
+                individual = pd_data["individual"][0]
+                individual_sample = individual[: min(20, len(individual))]
+                pdp_result["features"][feature] = {
+                    "values": values.tolist(),
+                    "average": average.tolist(),
+                    "individual": [curve.tolist() for curve in individual_sample],
+                }
+        except Exception as exc:  # noqa: BLE001
+            pdp_result["error"] = str(exc)
+        return pdp_result
 
     def _classification_metrics(self, y_true: pd.Series, y_pred: np.ndarray, class_labels: Optional[List[str]] = None) -> tuple[Dict[str, object], np.ndarray, List[str]]:
         accuracy = accuracy_score(y_true, y_pred)
@@ -7882,6 +8535,7 @@ class FlowDataApp:
         self._update_metrics_display(payload)
         self._update_confusion_matrix_plot(payload)
         self._update_importance_plot(payload)
+        self._update_explainability_views(payload.get("explanations"))
         self.save_model_button.configure(state="normal")
         self._record_training_run(payload)
 
@@ -7891,6 +8545,7 @@ class FlowDataApp:
         self.train_button.configure(state="normal")
         self.training_status_var.set(f"Training failed: {message}")
         messagebox.showerror("Training error", message)
+        self._reset_explainability_views()
 
     def _update_metrics_display(self, payload: Dict[str, object]) -> None:
         if not hasattr(self, "metrics_text"):
