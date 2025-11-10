@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import re
 import sys
 import tkinter as tk
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -34,6 +35,11 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from random_search import (
+    OptunaRandomSearchRunner,
+    RandomizedSearchUnavailableError,
+    SearchSpaceValidationError,
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -405,6 +411,7 @@ class FlowDataApp:
         self.csv_chunksize = DEFAULT_CSV_CHUNKSIZE
 
         self.training_model_var = tk.StringVar(value="Random Forest")
+        self.training_mode_var = tk.StringVar(value="single")
         self.n_estimators_var = tk.IntVar(value=300)
         self.max_depth_var = tk.StringVar(value="")
         self.max_features_var = tk.StringVar(value="sqrt")
@@ -412,6 +419,10 @@ class FlowDataApp:
         self.test_size_var = tk.DoubleVar(value=0.2)
         self.cv_folds_var = tk.IntVar(value=5)
         self.n_jobs_var = tk.IntVar(value=default_jobs)
+        self.search_iterations_var = tk.IntVar(value=25)
+        self.search_time_budget_var = tk.DoubleVar(value=600.0)
+        self.search_cpu_budget_var = tk.IntVar(value=default_jobs)
+        self.search_progress_var = tk.StringVar(value="")
         self.training_status_var = tk.StringVar(value="Training not started.")
         # Model-specific hyperparameters
         self.lda_solver_var = tk.StringVar(value="svd")
@@ -453,6 +464,7 @@ class FlowDataApp:
         self.keep_rf_oob_var = tk.BooleanVar(value=True)
         self.training_model_description_var = tk.StringVar(value="")
         self.class_balance_var.trace_add("write", lambda *_: self._mark_session_dirty())
+        self.random_search_runner: Optional[OptunaRandomSearchRunner] = None
         self.training_model_configs = {
             "Random Forest": {
                 "key": "rf",
@@ -500,6 +512,79 @@ class FlowDataApp:
                 "description": "Feed-forward neural network (PyTorch) with configurable hidden layers and optional GPU acceleration.",
             },
         }
+        self.random_search_param_definitions = {
+            "Random Forest": [
+                {
+                    "name": "n_estimators",
+                    "label": "Trees (n_estimators)",
+                    "type": "int",
+                    "default_min": 100,
+                    "default_max": 800,
+                },
+                {
+                    "name": "max_depth",
+                    "label": "Max depth",
+                    "type": "int_or_none",
+                    "default_min": 4,
+                    "default_max": 32,
+                    "allow_none_default": True,
+                },
+                {
+                    "name": "max_features",
+                    "label": "Max features",
+                    "type": "categorical",
+                    "default_choices": ["sqrt", "log2", "0.5", "0.8"],
+                },
+                {
+                    "name": "min_samples_leaf",
+                    "label": "Min samples per leaf",
+                    "type": "int",
+                    "default_min": 1,
+                    "default_max": 6,
+                },
+            ],
+            "SVM": [
+                {
+                    "name": "C",
+                    "label": "C (regularization)",
+                    "type": "float",
+                    "default_min": 0.1,
+                    "default_max": 10.0,
+                    "log": True,
+                },
+                {
+                    "name": "gamma",
+                    "label": "Gamma",
+                    "type": "categorical",
+                    "default_choices": ["scale", "auto"],
+                },
+                {
+                    "name": "kernel",
+                    "label": "Kernel",
+                    "type": "categorical",
+                    "default_choices": ["rbf", "poly", "linear"],
+                },
+            ],
+            "Logistic Regression": [
+                {
+                    "name": "C",
+                    "label": "Inverse regularization (C)",
+                    "type": "float",
+                    "default_min": 0.01,
+                    "default_max": 10.0,
+                    "log": True,
+                },
+                {
+                    "name": "max_iter",
+                    "label": "Max iterations",
+                    "type": "int",
+                    "default_min": 100,
+                    "default_max": 1000,
+                },
+            ],
+        }
+        self.random_search_param_vars: Dict[str, Dict[str, Dict[str, object]]] = {}
+        self.search_space_widgets: List[tk.Widget] = []
 
         # Clustering module state
         self.clustering_methods = {
@@ -1268,6 +1353,7 @@ class FlowDataApp:
         self.training_model_param_container.pack(fill="x", pady=(4, 0))
         self.training_model_param_frames: Dict[str, ttk.Frame] = {}
         self._build_training_model_frames()
+        self._init_random_search_ui(training_frame)
 
         eval_frame = ttk.LabelFrame(
             training_frame, text="Evaluation Settings", padding=8
@@ -1794,6 +1880,288 @@ class FlowDataApp:
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.training_model_param_frames["Neural Network"] = nn_frame
 
+    def _init_random_search_ui(self, training_frame: ttk.Frame) -> None:
+        search_frame = ttk.LabelFrame(training_frame, text="Randomized Search", padding=8)
+        search_frame.pack(fill="x", pady=(10, 0))
+        search_frame.columnconfigure(0, weight=1)
+        search_frame.columnconfigure(1, weight=1)
+        search_frame.columnconfigure(2, weight=1)
+
+        mode_row = ttk.Frame(search_frame)
+        mode_row.grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Radiobutton(
+            mode_row,
+            text="Single configuration",
+            value="single",
+            variable=self.training_mode_var,
+            command=self._on_training_mode_changed,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mode_row,
+            text="Randomized search",
+            value="search",
+            variable=self.training_mode_var,
+            command=self._on_training_mode_changed,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Label(
+            mode_row,
+            textvariable=self.search_progress_var,
+            foreground="#555555",
+        ).pack(side="left", padx=(16, 0))
+
+        ttk.Label(search_frame, text="Trials").grid(row=1, column=0, sticky="w")
+        ttk.Label(search_frame, text="Time budget (s)").grid(row=1, column=1, sticky="w")
+        ttk.Label(search_frame, text="CPU budget").grid(row=1, column=2, sticky="w")
+
+        trials_spin = ttk.Spinbox(
+            search_frame,
+            from_=1,
+            to=500,
+            increment=1,
+            textvariable=self.search_iterations_var,
+            width=8,
+        )
+        trials_spin.grid(row=2, column=0, sticky="w")
+        time_spin = ttk.Spinbox(
+            search_frame,
+            from_=0,
+            to=3600,
+            increment=30,
+            textvariable=self.search_time_budget_var,
+            width=10,
+            format="%.0f",
+        )
+        time_spin.grid(row=2, column=1, sticky="w", padx=(12, 0))
+        cpu_spin = ttk.Spinbox(
+            search_frame,
+            from_=0,
+            to=self.total_cpu_cores,
+            increment=1,
+            textvariable=self.search_cpu_budget_var,
+            width=8,
+        )
+        cpu_spin.grid(row=2, column=2, sticky="w", padx=(12, 0))
+
+        ttk.Label(
+            search_frame,
+            text=(
+                "Configure parameter ranges below. CPU budget limits parallelism (0=auto)."
+            ),
+            wraplength=680,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 4))
+
+        self.search_space_container = ttk.Frame(search_frame)
+        self.search_space_container.grid(row=4, column=0, columnspan=3, sticky="ew")
+
+        self._search_trials_spin = trials_spin
+        self._search_time_spin = time_spin
+        self._search_cpu_spin = cpu_spin
+        self.search_space_widgets = [trials_spin, time_spin, cpu_spin]
+
+        self.training_mode_var.trace_add(
+            "write", lambda *_: (self._mark_session_dirty(), self._on_training_mode_changed())
+        )
+        for var in (
+            self.search_iterations_var,
+            self.search_time_budget_var,
+            self.search_cpu_budget_var,
+        ):
+            var.trace_add("write", lambda *_: self._mark_session_dirty())
+
+        self._update_search_space_controls(self.training_model_var.get())
+
+    def _update_search_space_controls(self, model_name: str) -> None:
+        base_widgets = [
+            getattr(self, "_search_trials_spin", None),
+            getattr(self, "_search_time_spin", None),
+            getattr(self, "_search_cpu_spin", None),
+        ]
+        self.search_space_widgets = [w for w in base_widgets if w is not None]
+        for child in self.search_space_container.winfo_children():
+            child.destroy()
+
+        definitions = self.random_search_param_definitions.get(model_name)
+        if not definitions:
+            ttk.Label(
+                self.search_space_container,
+                text="Randomized search is not configured for this model.",
+                foreground="#555555",
+            ).grid(row=0, column=0, sticky="w")
+            return
+
+        self.search_space_container.columnconfigure(0, weight=1)
+        self.search_space_container.columnconfigure(1, weight=0)
+        self.search_space_container.columnconfigure(2, weight=0)
+        self.search_space_container.columnconfigure(3, weight=0)
+
+        existing = self.random_search_param_vars.get(model_name, {})
+        model_vars: Dict[str, Dict[str, object]] = {}
+        row = 0
+        for definition in definitions:
+            name = definition["name"]
+            label_text = definition.get("label", name)
+            param_type = definition.get("type", "int")
+            stored = existing.get(name, {}) if isinstance(existing, dict) else {}
+
+            ttk.Label(self.search_space_container, text=label_text).grid(
+                row=row, column=0, sticky="w", pady=(0, 2)
+            )
+
+            if param_type in {"int", "int_or_none"}:
+                min_var = stored.get("min_var") if stored else None
+                max_var = stored.get("max_var") if stored else None
+                if not isinstance(min_var, tk.IntVar):
+                    min_var = tk.IntVar(value=int(definition.get("default_min", 1)))
+                if not isinstance(max_var, tk.IntVar):
+                    max_var = tk.IntVar(value=int(definition.get("default_max", 10)))
+                min_spin = ttk.Spinbox(
+                    self.search_space_container,
+                    from_=-1_000_000,
+                    to=1_000_000,
+                    increment=1,
+                    textvariable=min_var,
+                    width=8,
+                )
+                max_spin = ttk.Spinbox(
+                    self.search_space_container,
+                    from_=-1_000_000,
+                    to=1_000_000,
+                    increment=1,
+                    textvariable=max_var,
+                    width=8,
+                )
+                ttk.Label(self.search_space_container, text="Min").grid(
+                    row=row, column=1, sticky="w"
+                )
+                ttk.Label(self.search_space_container, text="Max").grid(
+                    row=row, column=2, sticky="w"
+                )
+                min_spin.grid(row=row + 1, column=1, sticky="w")
+                max_spin.grid(row=row + 1, column=2, sticky="w")
+                self.search_space_widgets.extend([min_spin, max_spin])
+                min_var.trace_add("write", lambda *_: self._mark_session_dirty())
+                max_var.trace_add("write", lambda *_: self._mark_session_dirty())
+                entry: Dict[str, object] = {
+                    "type": param_type,
+                    "min_var": min_var,
+                    "max_var": max_var,
+                    "label": label_text,
+                }
+                if param_type == "int_or_none":
+                    allow_var = stored.get("allow_none_var") if stored else None
+                    if not isinstance(allow_var, tk.BooleanVar):
+                        allow_var = tk.BooleanVar(
+                            value=bool(definition.get("allow_none_default", False))
+                        )
+                    allow_check = ttk.Checkbutton(
+                        self.search_space_container,
+                        text="Allow None",
+                        variable=allow_var,
+                    )
+                    allow_check.grid(row=row + 1, column=3, sticky="w", padx=(8, 0))
+                    self.search_space_widgets.append(allow_check)
+                    allow_var.trace_add("write", lambda *_: self._mark_session_dirty())
+                    entry["allow_none_var"] = allow_var
+                model_vars[name] = entry
+                row += 2
+            elif param_type == "float":
+                min_var = stored.get("min_var") if stored else None
+                max_var = stored.get("max_var") if stored else None
+                if not isinstance(min_var, tk.DoubleVar):
+                    min_var = tk.DoubleVar(value=float(definition.get("default_min", 0.0)))
+                if not isinstance(max_var, tk.DoubleVar):
+                    max_var = tk.DoubleVar(value=float(definition.get("default_max", 1.0)))
+                ttk.Label(self.search_space_container, text="Min").grid(
+                    row=row, column=1, sticky="w"
+                )
+                ttk.Label(self.search_space_container, text="Max").grid(
+                    row=row, column=2, sticky="w"
+                )
+                min_spin = ttk.Spinbox(
+                    self.search_space_container,
+                    from_=-1e6,
+                    to=1e6,
+                    increment=0.01,
+                    textvariable=min_var,
+                    width=8,
+                    format="%.4f",
+                )
+                max_spin = ttk.Spinbox(
+                    self.search_space_container,
+                    from_=-1e6,
+                    to=1e6,
+                    increment=0.01,
+                    textvariable=max_var,
+                    width=8,
+                    format="%.4f",
+                )
+                min_spin.grid(row=row + 1, column=1, sticky="w")
+                max_spin.grid(row=row + 1, column=2, sticky="w")
+                self.search_space_widgets.extend([min_spin, max_spin])
+                min_var.trace_add("write", lambda *_: self._mark_session_dirty())
+                max_var.trace_add("write", lambda *_: self._mark_session_dirty())
+                model_vars[name] = {
+                    "type": param_type,
+                    "min_var": min_var,
+                    "max_var": max_var,
+                    "label": label_text,
+                    "log": bool(definition.get("log", False)),
+                }
+                row += 2
+            elif param_type == "categorical":
+                choices_var = stored.get("choices_var") if stored else None
+                if not isinstance(choices_var, tk.StringVar):
+                    default_choices = definition.get("default_choices", [])
+                    choices_text = ", ".join(str(choice) for choice in default_choices)
+                    choices_var = tk.StringVar(value=choices_text)
+                entry_field = ttk.Entry(
+                    self.search_space_container,
+                    textvariable=choices_var,
+                    width=40,
+                )
+                entry_field.grid(row=row + 1, column=0, columnspan=3, sticky="we")
+                self.search_space_widgets.append(entry_field)
+                choices_var.trace_add("write", lambda *_: self._mark_session_dirty())
+                model_vars[name] = {
+                    "type": param_type,
+                    "choices_var": choices_var,
+                    "label": label_text,
+                }
+                row += 2
+            else:
+                ttk.Label(
+                    self.search_space_container,
+                    text=f"Unsupported parameter type '{param_type}'.",
+                    foreground="red",
+                ).grid(row=row, column=0, sticky="w")
+                row += 1
+
+        self.random_search_param_vars[model_name] = model_vars
+        self._on_training_mode_changed()
+
+    def _on_training_mode_changed(self) -> None:
+        mode = self.training_mode_var.get()
+        for widget in self.search_space_widgets:
+            if widget is None:
+                continue
+            try:
+                if mode == "search":
+                    widget.state(["!disabled"])
+                else:
+                    widget.state(["disabled"])
+            except (tk.TclError, AttributeError):
+                state = "normal" if mode == "search" else "disabled"
+                try:
+                    widget.configure(state=state)
+                except (tk.TclError, AttributeError):
+                    continue
+        if mode != "search":
+            self.search_progress_var.set("")
+        else:
+            if not self.search_progress_var.get():
+                self.search_progress_var.set("Randomized search configured.")
+
     def _on_training_model_changed(self) -> None:
         selected = self.training_model_var.get()
         desc = self.training_model_configs.get(selected, {}).get("description", "")
@@ -1803,10 +2171,114 @@ class FlowDataApp:
         frame = self.training_model_param_frames.get(selected)
         if frame is not None:
             frame.pack(fill="x", pady=(4, 0))
+        self._update_search_space_controls(selected)
 
     def _handle_training_model_selected(self, _event: Optional[tk.Event] = None) -> None:
         self._on_training_model_changed()
         self._mark_session_dirty()
+
+    def _gather_random_search_config(self, model_name: str) -> Dict[str, object]:
+        if model_name not in self.random_search_param_definitions:
+            raise ValueError("Randomized search is not configured for the selected model.")
+
+        try:
+            iterations = int(self.search_iterations_var.get())
+        except (TypeError, ValueError):
+            raise ValueError("Enter a positive integer for randomized search trials.")
+        if iterations < 1:
+            raise ValueError("Randomized search requires at least one trial.")
+
+        try:
+            time_budget_value = float(self.search_time_budget_var.get())
+        except (TypeError, ValueError):
+            raise ValueError("Enter a numeric time budget in seconds.")
+        timeout = time_budget_value if time_budget_value > 0 else None
+
+        try:
+            cpu_budget_value = int(self.search_cpu_budget_var.get())
+        except (TypeError, ValueError):
+            raise ValueError("Enter a numeric CPU budget (0 for automatic).")
+        if cpu_budget_value <= 0:
+            cpu_budget = None
+        else:
+            cpu_budget = min(cpu_budget_value, self.total_cpu_cores)
+            if cpu_budget_value != cpu_budget:
+                self.search_cpu_budget_var.set(cpu_budget)
+
+        param_vars = self.random_search_param_vars.get(model_name)
+        if not param_vars:
+            raise ValueError("Configure the randomized search space before starting.")
+
+        search_space: Dict[str, Dict[str, object]] = {}
+        for name, info in param_vars.items():
+            param_type = info.get("type")
+            label = info.get("label", name)
+            if param_type in {"int", "int_or_none"}:
+                try:
+                    low = int(info["min_var"].get())  # type: ignore[index]
+                    high = int(info["max_var"].get())  # type: ignore[index]
+                except (TypeError, ValueError, KeyError):
+                    raise ValueError(f"Enter integer bounds for '{label}'.")
+                if low > high:
+                    raise ValueError(f"Minimum bound must be <= maximum for '{label}'.")
+                entry = {"type": "int", "low": low, "high": high}
+                if param_type == "int_or_none":
+                    allow_none_var = info.get("allow_none_var")
+                    allow_none = bool(allow_none_var.get()) if allow_none_var else False  # type: ignore[union-attr]
+                    entry = {
+                        "type": "int_or_none",
+                        "low": low,
+                        "high": high,
+                        "allow_none": allow_none,
+                    }
+                search_space[name] = entry
+            elif param_type == "float":
+                try:
+                    low = float(info["min_var"].get())  # type: ignore[index]
+                    high = float(info["max_var"].get())  # type: ignore[index]
+                except (TypeError, ValueError, KeyError):
+                    raise ValueError(f"Enter numeric bounds for '{label}'.")
+                if low > high:
+                    raise ValueError(f"Minimum bound must be <= maximum for '{label}'.")
+                entry = {"type": "float", "low": low, "high": high}
+                if info.get("log"):
+                    entry["log"] = True
+                search_space[name] = entry
+            elif param_type == "categorical":
+                choices_var = info.get("choices_var")
+                if choices_var is None:
+                    raise ValueError(f"Enter categorical choices for '{label}'.")
+                raw = str(choices_var.get())  # type: ignore[call-arg]
+                parts = [part.strip() for part in raw.split(",") if part.strip()]
+                if not parts:
+                    raise ValueError(f"Provide at least one choice for '{label}'.")
+                choices = [self._parse_search_choice(part) for part in parts]
+                search_space[name] = {"type": "categorical", "choices": choices}
+            else:
+                raise ValueError(f"Unsupported search parameter type '{param_type}' for '{label}'.")
+
+        return {
+            "n_trials": iterations,
+            "timeout": timeout,
+            "cpu_budget": cpu_budget,
+            "space": search_space,
+        }
+
+    @staticmethod
+    def _parse_search_choice(raw: str) -> object:
+        value = raw.strip()
+        if not value:
+            raise ValueError("Empty choice entries are not permitted.")
+        lowered = value.lower()
+        if lowered in {"none", "null"}:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                return value
 
     def _init_clustering_setup_tab(self, notebook: ttk.Notebook) -> None:
         module_container = ttk.Frame(notebook)
@@ -6748,6 +7220,239 @@ class FlowDataApp:
         self.training_in_progress = False
         self._reset_results_view()
 
+    def _execute_training_run(
+        self,
+        dataset: pd.DataFrame,
+        features: List[str],
+        target: str,
+        model_name: str,
+        params: Dict[str, object],
+        test_size: float,
+        cv_folds: int,
+        n_jobs: int,
+    ) -> Dict[str, object]:
+        start_time = time.time()
+        X = dataset[features]
+        y = dataset[target]
+        stratify = y if y.nunique() > 1 else None
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X,
+                y,
+                test_size=test_size,
+                random_state=RANDOM_STATE,
+                stratify=stratify,
+            )
+        except ValueError:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X,
+                y,
+                test_size=test_size,
+                random_state=RANDOM_STATE,
+                stratify=None,
+            )
+
+        class_balance_mode = self.class_balance_var.get()
+        class_weight_dict: Optional[Dict[object, float]] = None
+        fit_sample_weight: Optional[np.ndarray] = None
+        if class_balance_mode != "None" and len(y_train) > 0:
+            class_weight_dict = self._compute_class_weight_dict(y_train)
+            fit_sample_weight = self._sample_weight_array(y_train, class_weight_dict)
+
+        if model_name == "Random Forest":
+            payload = self._train_random_forest_model(
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                params,
+                cv_folds,
+                n_jobs,
+                class_weight_dict,
+                fit_sample_weight,
+            )
+        elif model_name == "LDA":
+            payload = self._train_lda_model(
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                params,
+                cv_folds,
+                n_jobs,
+                fit_sample_weight,
+            )
+        elif model_name == "SVM":
+            payload = self._train_svm_model(
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                params,
+                cv_folds,
+                n_jobs,
+                class_weight_dict,
+                fit_sample_weight,
+            )
+        elif model_name == "Logistic Regression":
+            payload = self._train_logistic_regression_model(
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                params,
+                cv_folds,
+                n_jobs,
+                class_weight_dict,
+                fit_sample_weight,
+            )
+        elif model_name == "Naive Bayes":
+            payload = self._train_naive_bayes_model(
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                params,
+                cv_folds,
+                n_jobs,
+                fit_sample_weight,
+            )
+        elif model_name == "XGBoost":
+            payload = self._train_xgboost_model(
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                params,
+                cv_folds,
+                n_jobs,
+                class_weight_dict,
+                fit_sample_weight,
+            )
+        elif model_name == "LightGBM":
+            payload = self._train_lightgbm_model(
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                params,
+                cv_folds,
+                n_jobs,
+                class_weight_dict,
+                fit_sample_weight,
+            )
+        elif model_name == "KMeans":
+            payload = self._train_kmeans_model(X_train, X_test, y_train, y_test, params)
+        elif model_name == "Neural Network":
+            payload = self._train_neural_network_model(
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                params,
+                class_weight_dict,
+            )
+        else:
+            raise ValueError(f"Unsupported model '{model_name}'.")
+
+        payload.setdefault("training_time", time.time() - start_time)
+        payload.setdefault("artifacts", {})
+        payload.update(
+            {
+                "model_name": model_name,
+                "features": features,
+                "target": target,
+            }
+        )
+        payload["config"] = {
+            "model_params": dict(params),
+            "test_size": test_size,
+            "cv_folds": cv_folds,
+            "n_jobs": n_jobs,
+        }
+        return payload
+
+    def _build_search_study_name(
+        self, model_name: str, features: List[str], target: str
+    ) -> str:
+        key = "|".join([model_name, target, *features])
+        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+        return f"{model_name.lower().replace(' ', '_')}_{digest}"
+
+    def _run_random_search(
+        self, config: Dict[str, object], dataset: pd.DataFrame
+    ) -> Dict[str, object]:
+        if self.random_search_runner is None:
+            try:
+                self.random_search_runner = OptunaRandomSearchRunner(
+                    self.cache_dir / "optuna"
+                )
+            except RandomizedSearchUnavailableError as exc:  # pragma: no cover - UI path
+                raise RuntimeError(str(exc)) from exc
+
+        runner = self.random_search_runner
+        model_name: str = config["model_name"]  # type: ignore[assignment]
+        features: List[str] = config["features"]  # type: ignore[assignment]
+        target: str = config["target"]  # type: ignore[assignment]
+        params = dict(config["model_params"])  # type: ignore[arg-type]
+        test_size = float(config["test_size"])  # type: ignore[arg-type]
+        cv_folds = int(config["cv_folds"])  # type: ignore[arg-type]
+        n_jobs = int(config["n_jobs"])  # type: ignore[arg-type]
+        search_config = config["search"]  # type: ignore[assignment]
+        study_name = self._build_search_study_name(model_name, features, target)
+
+        def evaluate(trial_params: Dict[str, object]) -> Tuple[float, Dict[str, object]]:
+            payload = self._execute_training_run(
+                dataset,
+                features,
+                target,
+                model_name,
+                trial_params,
+                test_size,
+                cv_folds,
+                n_jobs,
+            )
+            metric = float(payload["metrics"]["f1_macro"])  # type: ignore[index]
+            return metric, payload
+
+        def progress_callback(info: Dict[str, Any]) -> None:
+            message = dict(info)
+            message["status"] = "progress"
+            message["mode"] = "search"
+            message["total_trials"] = int(search_config.get("n_trials", 1))
+            self.training_queue.put(message)
+
+        try:
+            best_payload = runner.run(
+                study_name=study_name,
+                base_params=params,
+                search_space=search_config["space"],  # type: ignore[index]
+                evaluate=evaluate,
+                n_trials=int(search_config["n_trials"]),  # type: ignore[index]
+                timeout=search_config.get("timeout"),
+                progress_callback=progress_callback,
+            )
+        except SearchSpaceValidationError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        best_payload.setdefault("config", {})
+        best_payload["config"].update(
+            {
+                "mode": "search",
+                "search": {
+                    "n_trials": int(search_config.get("n_trials", 0)),
+                    "timeout": search_config.get("timeout"),
+                    "cpu_budget": search_config.get("cpu_budget"),
+                    "space": search_config.get("space"),
+                },
+            }
+        )
+        summary = best_payload.get("search_summary", {})
+        if isinstance(summary, dict):
+            summary.setdefault("requested_trials", int(search_config.get("n_trials", 0)))
+        best_payload["search_summary"] = summary
+        return best_payload
+
     def _clear_clustering_state(self) -> None:
         self.clustering_results = {}
         self.clustering_in_progress = False
@@ -7196,6 +7901,8 @@ class FlowDataApp:
             n_jobs = self.total_cpu_cores
         self.n_jobs_var.set(n_jobs)
 
+        mode = "search" if self.training_mode_var.get() == "search" else "single"
+
         config = {
             "model_name": model_name,
             "model_params": model_params,
@@ -7204,14 +7911,39 @@ class FlowDataApp:
             "n_jobs": n_jobs,
             "features": list(self.training_selection),
             "target": target_column,
+            "mode": mode,
         }
+
+        if mode == "search":
+            try:
+                search_config = self._gather_random_search_config(model_name)
+            except ValueError as exc:
+                messagebox.showerror("Randomized search", str(exc))
+                return
+            config["search"] = search_config
+            n_jobs = OptunaRandomSearchRunner.clamp_jobs(
+                n_jobs, search_config.get("cpu_budget"), self.total_cpu_cores
+            )
+            config["n_jobs"] = n_jobs
+            self.n_jobs_var.set(n_jobs)
+            trials = int(search_config.get("n_trials", 1))
+            self.training_progress.stop()
+            self.training_progress.configure(mode="determinate", maximum=max(trials, 1))
+            self.training_progress["value"] = 0
+            self.search_progress_var.set("Randomized search pending trials…")
+        else:
+            self.training_progress.configure(mode="indeterminate")
+            self.training_progress.start(12)
+            self.search_progress_var.set("")
 
         self.training_results = {}
         self.training_queue = queue.Queue()
         self.training_in_progress = True
         self.train_button.configure(state="disabled")
-        self.training_progress.start(12)
-        self.training_status_var.set("Training in progress…")
+        if mode == "search":
+            self.training_status_var.set("Randomized search in progress…")
+        else:
+            self.training_status_var.set("Training in progress…")
         if hasattr(self, "metrics_text"):
             self.metrics_text.configure(state="normal")
             self.metrics_text.delete("1.0", tk.END)
@@ -7232,149 +7964,20 @@ class FlowDataApp:
 
     def _train_model_worker(self, config: Dict[str, object], dataset: pd.DataFrame) -> None:
         try:
-            start_time = time.time()
-            model_name = config["model_name"]
-            params = config["model_params"]
-            features: List[str] = config["features"]  # type: ignore[assignment]
-            target: str = config["target"]  # type: ignore[assignment]
-            test_size = float(config["test_size"])  # type: ignore[arg-type]
-            cv_folds = int(config["cv_folds"])  # type: ignore[arg-type]
-            n_jobs = int(config["n_jobs"])  # type: ignore[arg-type]
-
-            X = dataset[features]
-            y = dataset[target]
-            stratify = y if y.nunique() > 1 else None
-            try:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X,
-                    y,
-                    test_size=test_size,
-                    random_state=RANDOM_STATE,
-                    stratify=stratify,
-                )
-            except ValueError:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X,
-                    y,
-                    test_size=test_size,
-                    random_state=RANDOM_STATE,
-                    stratify=None,
-                )
-
-            class_balance_mode = self.class_balance_var.get()
-            class_weight_dict: Optional[Dict[object, float]] = None
-            fit_sample_weight: Optional[np.ndarray] = None
-            if class_balance_mode != "None" and len(y_train) > 0:
-                class_weight_dict = self._compute_class_weight_dict(y_train)
-                fit_sample_weight = self._sample_weight_array(y_train, class_weight_dict)
-
-            if model_name == "Random Forest":
-                payload = self._train_random_forest_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    cv_folds,
-                    n_jobs,
-                    class_weight_dict,
-                    fit_sample_weight,
-                )
-            elif model_name == "LDA":
-                payload = self._train_lda_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    cv_folds,
-                    n_jobs,
-                    fit_sample_weight,
-                )
-            elif model_name == "SVM":
-                payload = self._train_svm_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    cv_folds,
-                    n_jobs,
-                    class_weight_dict,
-                    fit_sample_weight,
-                )
-            elif model_name == "Logistic Regression":
-                payload = self._train_logistic_regression_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    cv_folds,
-                    n_jobs,
-                    class_weight_dict,
-                    fit_sample_weight,
-                )
-            elif model_name == "Naive Bayes":
-                payload = self._train_naive_bayes_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    fit_sample_weight,
-                )
-            elif model_name == "XGBoost":
-                payload = self._train_xgboost_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    class_weight_dict,
-                    fit_sample_weight,
-                    n_jobs,
-                )
-            elif model_name == "LightGBM":
-                payload = self._train_lightgbm_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    class_weight_dict,
-                    fit_sample_weight,
-                    n_jobs,
-                )
-            elif model_name == "KMeans":
-                payload = self._train_kmeans_model(X_train, X_test, y_train, y_test, params)
-            elif model_name == "Neural Network":
-                payload = self._train_neural_network_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    class_weight_dict,
-                )
+            mode = config.get("mode", "single")
+            if mode == "search":
+                payload = self._run_random_search(config, dataset)
             else:
-                raise ValueError(f"Unsupported model '{model_name}'.")
-
-            payload.setdefault("training_time", time.time() - start_time)
-            payload.setdefault("artifacts", {})
-            payload.update(
-                {
-                    "model_name": model_name,
-                    "features": features,
-                    "target": target,
-                }
-            )
-            payload["config"] = {
-                "model_params": dict(params),
-                "test_size": test_size,
-                "cv_folds": cv_folds,
-                "n_jobs": n_jobs,
-            }
+                payload = self._execute_training_run(
+                    dataset,
+                    config["features"],  # type: ignore[index]
+                    config["target"],  # type: ignore[index]
+                    config["model_name"],  # type: ignore[index]
+                    config["model_params"],  # type: ignore[index]
+                    float(config["test_size"]),  # type: ignore[arg-type]
+                    int(config["cv_folds"]),  # type: ignore[arg-type]
+                    int(config["n_jobs"]),  # type: ignore[arg-type]
+                )
             self.training_queue.put({"status": "success", "payload": payload})
         except Exception as exc:  # noqa: BLE001
             self.training_queue.put({"status": "error", "message": str(exc)})
@@ -7836,13 +8439,42 @@ class FlowDataApp:
 
         if message["status"] == "success":
             self._handle_training_success(message["payload"])
+        elif message["status"] == "progress":
+            self._handle_training_progress(message)
+            self.root.after(200, self._check_training_queue)
         else:
             self._handle_training_failure(message["message"])
+
+    def _handle_training_progress(self, message: Dict[str, object]) -> None:
+        trials_completed = int(message.get("trials_completed", 0))
+        total_trials = int(message.get("total_trials", max(1, trials_completed)))
+        trial_number = int(message.get("trial", trials_completed - 1)) + 1
+        metric = message.get("metric")
+        best_metric = message.get("best_metric")
+        elapsed = float(message.get("elapsed", 0.0))
+        progress_text = (
+            f"Trial {trial_number}/{total_trials}: "
+            f"F1={metric:.3f} (best {best_metric:.3f}), elapsed {elapsed:.1f}s"
+            if isinstance(metric, (int, float)) and isinstance(best_metric, (int, float))
+            else f"Completed {trials_completed}/{total_trials} trials"
+        )
+        self.search_progress_var.set(progress_text)
+        if self.training_progress.cget("mode") == "determinate":
+            maximum = self.training_progress.cget("maximum")
+            try:
+                maximum_value = float(maximum)
+            except (TypeError, ValueError):
+                maximum_value = float(total_trials)
+            self.training_progress["value"] = min(trials_completed, maximum_value)
+        self.training_status_var.set("Randomized search in progress…")
 
     def _handle_training_success(self, payload: Dict[str, object]) -> None:
         self.training_in_progress = False
         self.training_progress.stop()
         self.train_button.configure(state="normal")
+        self.training_progress.configure(mode="indeterminate")
+        self.training_progress["value"] = 0
+        self.search_progress_var.set("")
 
         self.trained_model = payload["model"]  # type: ignore[assignment]
         self.training_results = payload
@@ -7855,6 +8487,16 @@ class FlowDataApp:
             f"Training complete in {elapsed:.2f}s. "
             f"Test accuracy: {accuracy:.3f}, macro F1: {f1_macro:.3f}."
         )
+        search_summary = payload.get("search_summary")
+        if isinstance(search_summary, dict):
+            best_trial = search_summary.get("best_trial")
+            trials_completed = search_summary.get("trials_completed")
+            best_score = search_summary.get("best_score")
+            if trials_completed and isinstance(best_score, (int, float)):
+                status_message += (
+                    f" Best trial {best_trial} of {trials_completed} "
+                    f"(macro F1 {best_score:.3f})."
+                )
         extra_status = metrics.get("extra_status")  # type: ignore[attr-defined]
         if extra_status:
             status_message += f" {extra_status}"
@@ -7889,6 +8531,9 @@ class FlowDataApp:
         self.training_in_progress = False
         self.training_progress.stop()
         self.train_button.configure(state="normal")
+        self.training_progress.configure(mode="indeterminate")
+        self.training_progress["value"] = 0
+        self.search_progress_var.set("")
         self.training_status_var.set(f"Training failed: {message}")
         messagebox.showerror("Training error", message)
 
