@@ -28,6 +28,35 @@ This desktop app helps you explore and curate large collections of flow cytometr
    python3 app.py
    ```
 
+## Command-line interface
+
+Automated environments can drive the training pipeline without the GUI via the
+CLI module:
+
+```bash
+python3 -m training_cli train \
+  --inputs sample_data/demo_flow_0.csv sample_data/demo_flow_1.csv \
+  --target CellType \
+  --model random_forest --model svm \
+  --output-dir cli_runs
+```
+
+Key flags:
+
+- `--config`: JSON file describing the models/hyperparameters to train. When
+  omitted, a Random Forest is trained by default.
+- `--export`: repeatable flag selecting the export formats to generate
+  (`joblib`, `onnx`, `pmml`). All formats are produced when the flag is not
+  supplied.
+- `--registry-dir`: optional override that points to the directory containing
+  `.flow_cache/run_registry.json`. The CLI writes run metadata compatible with
+  the GUI registry by default.
+- `evaluate`: sub-command that re-runs metrics for a previously exported
+  `model.joblib` bundle against new CSV files.
+
+Run `python3 -m training_cli list-models` to see the available model
+identifiers. Use `python3 -m training_cli --help` for the full set of options.
+
 ## Usage Tips
 
 1. Select one or more CSV files. The summary labels update with total files, combined row counts, and unique columns.
