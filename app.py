@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -169,6 +169,269 @@ class ScrollableFrame(ttk.Frame):
             self.canvas.xview_scroll(-1, "units")
         elif event.num == 5:
             self.canvas.xview_scroll(1, "units")
+
+
+@dataclass
+class CommandDefinition:
+    """Describes a command surfaced to keyboard shortcuts or the palette."""
+
+    label: str
+    callback: Callable[[], None]
+    description: str
+    category: str
+    accelerator: Optional[str] = None
+
+
+def filter_commands(
+    commands: Sequence[CommandDefinition], query: str
+) -> List[CommandDefinition]:
+    """Return commands matching the given query string.
+
+    The filter performs a case-insensitive containment check across the label,
+    description, category, and accelerator text. Multiple whitespace-separated
+    tokens must all be present in a command's metadata.
+    """
+
+    normalized = query.strip().lower()
+    if not normalized:
+        return list(commands)
+
+    tokens = normalized.split()
+    matches: List[CommandDefinition] = []
+    for command in commands:
+        haystack = " ".join(
+            filter(
+                None,
+                [
+                    command.label,
+                    command.description,
+                    command.category,
+                    command.accelerator or "",
+                ],
+            )
+        ).lower()
+        if all(token in haystack for token in tokens):
+            matches.append(command)
+    return matches
+
+
+class TooltipManager:
+    """Simple tooltip controller that supports mouse and keyboard focus."""
+
+    def __init__(self, root: tk.Widget) -> None:
+        self.root = root
+        self._tooltip_window: Optional[tk.Toplevel] = None
+        self._after_id: Optional[str] = None
+
+    def register(self, widget: tk.Widget, text: str, delay_ms: int = 400) -> None:
+        def schedule(_: tk.Event) -> None:
+            self._schedule(widget, text, delay_ms)
+
+        def hide(_: tk.Event) -> None:
+            self.hide()
+
+        widget.bind("<Enter>", schedule, add=True)
+        widget.bind("<Leave>", hide, add=True)
+        widget.bind("<FocusIn>", schedule, add=True)
+        widget.bind("<FocusOut>", hide, add=True)
+        widget.bind("<ButtonPress>", hide, add=True)
+
+    def _schedule(self, widget: tk.Widget, text: str, delay_ms: int) -> None:
+        if self._after_id is not None:
+            widget.after_cancel(self._after_id)
+
+        self._after_id = widget.after(delay_ms, lambda: self._show(widget, text))
+
+    def _show(self, widget: tk.Widget, text: str) -> None:
+        self.hide()
+        tooltip = tk.Toplevel(widget)
+        tooltip.wm_overrideredirect(True)
+        tooltip.attributes("-topmost", True)
+        tooltip.configure(background="#1f2933")
+
+        label = ttk.Label(
+            tooltip,
+            text=text,
+            justify="left",
+            wraplength=320,
+            foreground="#ffffff",
+            background="#1f2933",
+            padding=8,
+        )
+        label.pack()
+
+        x = widget.winfo_rootx() + 12
+        y = widget.winfo_rooty() + widget.winfo_height() + 8
+        tooltip.wm_geometry(f"+{x}+{y}")
+        self._tooltip_window = tooltip
+
+    def hide(self) -> None:
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+        if self._tooltip_window is not None:
+            try:
+                self._tooltip_window.destroy()
+            except tk.TclError:
+                pass
+            self._tooltip_window = None
+
+
+class CommandPalette(tk.Toplevel):
+    """A minimal command palette surfaced through a searchable list."""
+
+    def __init__(
+        self,
+        master: tk.Widget,
+        commands: Sequence[CommandDefinition],
+        on_execute: Callable[[CommandDefinition], None],
+    ) -> None:
+        super().__init__(master)
+        self.withdraw()
+        self.title("Command Palette")
+        self.transient(master)
+        self.geometry("520x360")
+        self.resizable(True, True)
+        self._commands: List[CommandDefinition] = list(commands)
+        self._filtered: List[CommandDefinition] = list(commands)
+        self._on_execute = on_execute
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            self,
+            text="Type to filter commands. Use arrow keys to choose, then press Enter.",
+            style="Info.TLabel",
+            wraplength=460,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 4))
+
+        self.search_var = tk.StringVar()
+        search_entry = ttk.Entry(self, textvariable=self.search_var)
+        search_entry.grid(row=1, column=0, sticky="ew", padx=16)
+        search_entry.bind("<KeyRelease>", lambda _e: self._on_query_changed())
+
+        tree_container = ttk.Frame(self, padding=(16, 12, 16, 0))
+        tree_container.grid(row=2, column=0, sticky="nsew")
+        tree_container.columnconfigure(0, weight=1)
+        tree_container.rowconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(
+            tree_container,
+            columns=("command", "shortcut"),
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        self.tree.heading("command", text="Command")
+        self.tree.heading("shortcut", text="Shortcut")
+        self.tree.column("command", width=320, anchor="w")
+        self.tree.column("shortcut", width=120, anchor="center")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.tree.bind("<Double-Button-1>", lambda _e: self._run_selected())
+        self.tree.bind("<Return>", lambda _e: self._run_selected())
+        self.tree.bind("<KP_Enter>", lambda _e: self._run_selected())
+
+        self.description_var = tk.StringVar(value="Select a command to view details.")
+        ttk.Label(
+            self,
+            textvariable=self.description_var,
+            style="Info.TLabel",
+            wraplength=460,
+            justify="left",
+        ).grid(row=3, column=0, sticky="ew", padx=16, pady=(8, 12))
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda _e: self.close())
+        self.bind("<FocusOut>", lambda _e: self._maybe_hide())
+        self.tree.bind("<<TreeviewSelect>>", self._update_description)
+
+        self._tree_command: Dict[str, CommandDefinition] = {}
+        self.refresh(commands)
+
+    def refresh(self, commands: Sequence[CommandDefinition]) -> None:
+        self._commands = list(commands)
+        self._on_query_changed()
+
+    def open(self) -> None:
+        self.deiconify()
+        self.grab_set()
+        self.search_var.set("")
+        self._on_query_changed()
+        self.after(10, lambda: self.focus_and_select())
+
+    def focus_and_select(self) -> None:
+        entry_widget = self.nametowidget(str(self.grid_slaves(row=1, column=0)[0]))
+        entry_widget.focus_set()
+        entry_widget.select_range(0, tk.END)
+
+    def _on_query_changed(self) -> None:
+        query = self.search_var.get()
+        self._filtered = filter_commands(self._commands, query)
+        self._rebuild_tree()
+
+    def _rebuild_tree(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self._tree_command.clear()
+        for command in self._filtered:
+            item_id = self.tree.insert(
+                "",
+                "end",
+                values=(command.label, command.accelerator or ""),
+            )
+            self._tree_command[item_id] = command
+
+        if self._filtered:
+            first_id = self.tree.get_children()[0]
+            self.tree.selection_set(first_id)
+            self.tree.focus(first_id)
+            self._update_description()
+        else:
+            self.description_var.set("No commands match your search.")
+
+    def _update_description(self, _event: Optional[tk.Event] = None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            self.description_var.set("Select a command to view details.")
+            return
+        command = self._tree_command.get(selection[0])
+        if command is None:
+            self.description_var.set("Select a command to view details.")
+            return
+        self.description_var.set(f"{command.category}: {command.description}")
+
+    def _run_selected(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        command = self._tree_command.get(selection[0])
+        if command is None:
+            return
+        self.close()
+        self._on_execute(command)
+
+    def close(self) -> None:
+        self.grab_release()
+        self.withdraw()
+        self.search_var.set("")
+
+    def _maybe_hide(self) -> None:
+        # Only hide if focus leaves the palette to another toplevel entirely.
+        try:
+            if self.focus_displayof() is None:
+                self.close()
+        except tk.TclError:
+            self.close()
 
 
 @dataclass
@@ -342,10 +605,41 @@ else:
 
 
 class FlowDataApp:
+    def _init_styles(self) -> None:
+        style = ttk.Style(self.root)
+        base_bg = style.lookup("TFrame", "background") or style.lookup("TLabel", "background")
+        style.configure("Info.TLabel", foreground="#1f2933", padding=(0, 2, 0, 6))
+        if base_bg:
+            style.configure("Info.TLabel", background=base_bg)
+
+    def _format_shortcut(self, *keys: str) -> str:
+        mapping = {
+            "Control": "Ctrl",
+            "Shift": "Shift",
+            "Alt": "Alt",
+            "Command": "⌘",
+        }
+        if IS_DARWIN:
+            mapping.update({"Shift": "⇧", "Alt": "⌥", "Control": "⌃"})
+        return "+".join(mapping.get(key, key) for key in keys)
+
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Flow Cytometry Data Preparation")
         self.root.geometry("1100x700")
+
+        self._init_styles()
+        self.tooltip_manager = TooltipManager(self.root)
+        self.command_palette: Optional[CommandPalette] = None
+        self.command_definitions: List[CommandDefinition] = []
+        self.top_tabs: Dict[str, tk.Widget] = {}
+        self.sub_tabs: Dict[str, Dict[str, tk.Widget]] = {
+            "data": {},
+            "training": {},
+            "clustering": {},
+        }
+        self.shortcut_modifier = "Command" if IS_DARWIN else "Control"
+        self.shortcut_display = "⌘" if IS_DARWIN else "Ctrl"
 
         self.app_dir = Path(__file__).resolve().parent
         self.cache_dir = self.app_dir / ".flow_cache"
@@ -769,20 +1063,36 @@ class FlowDataApp:
         self._build_summary()
         self._build_notebook()
         self._build_status_bar()
+        self._configure_keyboard_shortcuts()
+        self._build_command_registry()
 
         self._load_run_registry()
         self.root.after(400, self._load_session_state)
         self._reset_results_view()
 
+    def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
+        self.tooltip_manager.register(widget, text)
+
+    def _add_info_blurb(self, parent: tk.Widget, text: str) -> ttk.Label:
+        label = ttk.Label(parent, text=text, style="Info.TLabel", wraplength=780, justify="left")
+        label.pack(fill="x", pady=(0, 8))
+        return label
+
     def _build_controls(self) -> None:
         control_frame = ttk.Frame(self.root, padding=(12, 8))
         control_frame.pack(fill="x")
 
-        ttk.Button(
+        select_button = ttk.Button(
             control_frame,
             text="Select CSV Files",
             command=self.select_files,
-        ).pack(side="left")
+            takefocus=True,
+        )
+        select_button.pack(side="left")
+        self._add_tooltip(
+            select_button,
+            f"Load CSV files into the workspace ({self._format_shortcut(self.shortcut_modifier, 'O')}).",
+        )
 
         self.files_loaded_var = tk.StringVar(value="No files loaded")
         ttk.Label(control_frame, textvariable=self.files_loaded_var).pack(
@@ -811,12 +1121,17 @@ class FlowDataApp:
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=12, pady=12)
         self.notebook = notebook
+        notebook.enable_traversal()
 
         # Data module with Files / Columns
         data_tab = ttk.Frame(notebook)
         notebook.add(data_tab, text="Data Overview")
+        self.top_tabs["data"] = data_tab
         data_notebook = ttk.Notebook(data_tab)
         data_notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        data_notebook.enable_traversal()
+        self.data_notebook = data_notebook
+        self.sub_tabs["data"] = {}
         self._init_files_tab(data_notebook)
         self._init_columns_tab(data_notebook)
         self._init_quality_tab(data_notebook)
@@ -824,8 +1139,12 @@ class FlowDataApp:
         # Training module with setup/run/results/visuals
         training_tab = ttk.Frame(notebook)
         notebook.add(training_tab, text="Training Module")
+        self.top_tabs["training"] = training_tab
         training_notebook = ttk.Notebook(training_tab)
         training_notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        training_notebook.enable_traversal()
+        self.training_notebook = training_notebook
+        self.sub_tabs["training"] = {}
         self._init_training_setup_tab(training_notebook)
         self._init_training_module_tab(training_notebook)
         self._init_training_visuals_tab(training_notebook)
@@ -835,8 +1154,12 @@ class FlowDataApp:
         # Clustering module with setup/results/visualization
         clustering_tab = ttk.Frame(notebook)
         notebook.add(clustering_tab, text="Clustering Module")
+        self.top_tabs["clustering"] = clustering_tab
         clustering_notebook = ttk.Notebook(clustering_tab)
         clustering_notebook.pack(fill="both", expand=True, padx=8, pady=8)
+        clustering_notebook.enable_traversal()
+        self.clustering_notebook = clustering_notebook
+        self.sub_tabs["clustering"] = {}
         self._init_clustering_setup_tab(clustering_notebook)
         self._init_clustering_results_tab(clustering_notebook)
         self._init_clustering_visuals_tab(clustering_notebook)
@@ -844,13 +1167,276 @@ class FlowDataApp:
         self._init_clustering_annotation_tab(clustering_notebook)
         self._init_clustering_comparison_tab(clustering_notebook)
 
+    def _navigate_to_tab(
+        self,
+        top_key: str,
+        sub_key: Optional[str] = None,
+        focus_widget: Optional[tk.Widget] = None,
+    ) -> None:
+        top_widget = self.top_tabs.get(top_key)
+        if top_widget is None:
+            return
+        self.notebook.select(top_widget)
+        self.notebook.focus_set()
+
+        if sub_key:
+            sub_container = self.sub_tabs.get(top_key, {}).get(sub_key)
+            if sub_container is not None:
+                if top_key == "data":
+                    notebook = getattr(self, "data_notebook", None)
+                elif top_key == "training":
+                    notebook = getattr(self, "training_notebook", None)
+                else:
+                    notebook = getattr(self, "clustering_notebook", None)
+                if notebook is not None:
+                    notebook.select(sub_container)
+                    notebook.focus_set()
+
+        target = focus_widget
+        if target is None:
+            default_targets: Dict[tuple[str, Optional[str]], Optional[tk.Widget]] = {
+                ("data", "files"): getattr(self, "files_tree", None),
+                ("data", "columns"): getattr(self, "columns_tree", None),
+                ("data", "quality"): getattr(self, "quality_tree", None),
+                ("training", "module"): getattr(self, "train_button", None),
+                ("training", "setup"): getattr(self, "training_listbox", None),
+                ("clustering", "setup"): getattr(self, "clustering_listbox", None),
+            }
+            target = default_targets.get((top_key, sub_key))
+        if target is not None:
+            self.root.after(25, target.focus_set)
+
+    def _configure_keyboard_shortcuts(self) -> None:
+        mod = self.shortcut_modifier
+
+        def bind(sequence: str, callback: Callable[[], None]) -> None:
+            def handler(_event: tk.Event, cb: Callable[[], None] = callback) -> str:
+                cb()
+                return "break"
+
+            self.root.bind_all(sequence, handler, add=True)
+
+        bind(f"<{mod}-o>", self.select_files)
+        bind(f"<{mod}-Shift-P>", self.open_command_palette)
+        bind(f"<{mod}-k>", self.open_command_palette)
+        bind(f"<{mod}-1>", lambda: self._navigate_to_tab("data"))
+        bind(f"<{mod}-2>", lambda: self._navigate_to_tab("training"))
+        bind(f"<{mod}-3>", lambda: self._navigate_to_tab("clustering"))
+        bind(f"<{mod}-Shift-F>", lambda: self._navigate_to_tab("data", "files"))
+        bind(f"<{mod}-Shift-C>", lambda: self._navigate_to_tab("data", "columns"))
+        bind(f"<{mod}-Shift-Q>", lambda: self._navigate_to_tab("data", "quality"))
+        bind(f"<{mod}-Shift-S>", lambda: self._navigate_to_tab("training", "setup"))
+        bind(f"<{mod}-Shift-T>", lambda: self._navigate_to_tab("training", "module"))
+        bind(f"<{mod}-Shift-V>", lambda: self._navigate_to_tab("training", "visuals"))
+        bind(f"<{mod}-Shift-R>", lambda: self._navigate_to_tab("training", "results"))
+        bind(f"<{mod}-Shift-G>", lambda: self._navigate_to_tab("training", "runs"))
+        bind(f"<{mod}-Shift-U>", lambda: self._navigate_to_tab("clustering", "setup"))
+        bind(f"<{mod}-Shift-L>", lambda: self._navigate_to_tab("clustering", "results"))
+        bind(f"<{mod}-Shift-H>", lambda: self._navigate_to_tab("clustering", "visuals"))
+        bind(f"<{mod}-Shift-E>", lambda: self._navigate_to_tab("clustering", "explorer"))
+        bind(f"<{mod}-Shift-A>", lambda: self._navigate_to_tab("clustering", "annotation"))
+        bind(f"<{mod}-Shift-M>", lambda: self._navigate_to_tab("clustering", "comparison"))
+
+        def show_help() -> None:
+            self._show_keyboard_reference()
+
+        bind("<F1>", show_help)
+
+    def _build_command_registry(self) -> None:
+        mod = self.shortcut_modifier
+        shift = "Shift"
+        self.command_definitions = [
+            CommandDefinition(
+                label="Open command palette",
+                callback=self.open_command_palette,
+                description="Show a searchable list of navigation targets and actions.",
+                category="Navigation",
+                accelerator=f"{self._format_shortcut(mod, shift, 'P')} / {self._format_shortcut(mod, 'K')}",
+            ),
+            CommandDefinition(
+                label="Load CSV files",
+                callback=self.select_files,
+                description="Choose one or more CSV files to add to the session.",
+                category="Data",
+                accelerator=self._format_shortcut(mod, "O"),
+            ),
+            CommandDefinition(
+                label="Go to Data Overview",
+                callback=lambda: self._navigate_to_tab("data"),
+                description="Focus the Data Overview module tabs.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, "1"),
+            ),
+            CommandDefinition(
+                label="Go to Files table",
+                callback=lambda: self._navigate_to_tab("data", "files"),
+                description="Review loaded files and their row/column counts.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "F"),
+            ),
+            CommandDefinition(
+                label="Go to Column coverage",
+                callback=lambda: self._navigate_to_tab("data", "columns"),
+                description="Inspect which files contain each column.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "C"),
+            ),
+            CommandDefinition(
+                label="Go to Data quality",
+                callback=lambda: self._navigate_to_tab("data", "quality"),
+                description="View inferred data types, missingness, and notes per column.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "Q"),
+            ),
+            CommandDefinition(
+                label="Go to Training setup",
+                callback=lambda: self._navigate_to_tab("training", "setup"),
+                description="Configure training features, targets, and metadata.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "S"),
+            ),
+            CommandDefinition(
+                label="Go to Training controls",
+                callback=lambda: self._navigate_to_tab("training", "module"),
+                description="Adjust downsampling and start model training.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "T"),
+            ),
+            CommandDefinition(
+                label="Preview downsampling",
+                callback=self._training_preview_downsampling,
+                description="Calculate the effect of the selected downsampling method before training.",
+                category="Training",
+            ),
+            CommandDefinition(
+                label="Train model",
+                callback=self.start_training,
+                description="Kick off the configured training run using the current selections.",
+                category="Training",
+                accelerator=None,
+            ),
+            CommandDefinition(
+                label="Go to Training results",
+                callback=lambda: self._navigate_to_tab("training", "results"),
+                description="Review metrics, reports, and confusion matrices for the latest run.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "R"),
+            ),
+            CommandDefinition(
+                label="Go to Training visuals",
+                callback=lambda: self._navigate_to_tab("training", "visuals"),
+                description="Inspect performance plots and feature importances.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "V"),
+            ),
+            CommandDefinition(
+                label="Go to Run registry",
+                callback=lambda: self._navigate_to_tab("training", "runs"),
+                description="Browse saved training runs and metadata.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "G"),
+            ),
+            CommandDefinition(
+                label="Go to Clustering setup",
+                callback=lambda: self._navigate_to_tab("clustering", "setup"),
+                description="Select clustering features, sampling, and algorithms.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "U"),
+            ),
+            CommandDefinition(
+                label="Go to Clustering results",
+                callback=lambda: self._navigate_to_tab("clustering", "results"),
+                description="Review summaries for each clustering algorithm.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "L"),
+            ),
+            CommandDefinition(
+                label="Go to Clustering visuals",
+                callback=lambda: self._navigate_to_tab("clustering", "visuals"),
+                description="Inspect UMAP projections and heatmaps.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "H"),
+            ),
+            CommandDefinition(
+                label="Go to Cluster explorer",
+                callback=lambda: self._navigate_to_tab("clustering", "explorer"),
+                description="Interactively inspect clusters and marker expression.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "E"),
+            ),
+            CommandDefinition(
+                label="Go to Cluster annotation",
+                callback=lambda: self._navigate_to_tab("clustering", "annotation"),
+                description="Assign biological annotations to discovered clusters.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "A"),
+            ),
+            CommandDefinition(
+                label="Go to Cluster comparison",
+                callback=lambda: self._navigate_to_tab("clustering", "comparison"),
+                description="Compare clustering solutions against categorical references.",
+                category="Navigation",
+                accelerator=self._format_shortcut(mod, shift, "M"),
+            ),
+            CommandDefinition(
+                label="Show keyboard shortcuts",
+                callback=self._show_keyboard_reference,
+                description="Display a summary of available keyboard shortcuts and navigation aids.",
+                category="Help",
+                accelerator="F1",
+            ),
+        ]
+
+    def open_command_palette(self) -> None:
+        self._build_command_registry()
+        if self.command_palette is None or not self.command_palette.winfo_exists():
+            self.command_palette = CommandPalette(
+                self.root,
+                self.command_definitions,
+                self._execute_command,
+            )
+        else:
+            self.command_palette.refresh(self.command_definitions)
+        self.command_palette.open()
+
+    def _execute_command(self, command: CommandDefinition) -> None:
+        try:
+            command.callback()
+        except Exception as exc:  # pragma: no cover - UI feedback path
+            messagebox.showerror(
+                "Command failed",
+                f"Could not execute '{command.label}'.\n\n{exc}",
+            )
+
+    def _show_keyboard_reference(self) -> None:
+        shortcuts = [
+            f"{self._format_shortcut(self.shortcut_modifier, 'O')} – Load CSV files",
+            f"{self._format_shortcut(self.shortcut_modifier, 'Shift', 'P')} – Open command palette",
+            f"{self._format_shortcut(self.shortcut_modifier, 'K')} – Open command palette",
+            f"{self._format_shortcut(self.shortcut_modifier, '1')} / {self._format_shortcut(self.shortcut_modifier, '2')} / {self._format_shortcut(self.shortcut_modifier, '3')} – Switch primary module",
+            f"{self._format_shortcut(self.shortcut_modifier, 'Shift', 'F')} – Focus Data › Files",
+            f"{self._format_shortcut(self.shortcut_modifier, 'Shift', 'S')} – Focus Training setup",
+            f"{self._format_shortcut(self.shortcut_modifier, 'Shift', 'T')} – Focus Training controls",
+            f"{self._format_shortcut(self.shortcut_modifier, 'Shift', 'U')} – Focus Clustering setup",
+            "F1 – Show this shortcut reference",
+        ]
+        message = "Keyboard shortcuts help keep the interface fully navigable from the keyboard.\n\n" + "\n".join(shortcuts)
+        messagebox.showinfo("Keyboard shortcuts", message)
+
     def _init_files_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Files")
+        self.sub_tabs.setdefault("data", {})["files"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         files_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         files_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            files_tab,
+            "Use the Files table to review imported CSV datasets. Navigate with the keyboard arrows, "
+            "press Enter to focus the grid, and use the toolbar button or command palette to add or remove files.",
+        )
 
         columns = ("file", "rows", "columns")
         tree = ttk.Treeview(
@@ -858,6 +1444,7 @@ class FlowDataApp:
             columns=columns,
             show="headings",
             height=18,
+            takefocus=True,
         )
         tree.heading("file", text="File")
         tree.heading("rows", text="Rows")
@@ -878,15 +1465,22 @@ class FlowDataApp:
         self.files_tree.configure(yscroll=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
 
-        ttk.Button(
+        remove_button = ttk.Button(
             files_tab,
             text="Remove Selected Files",
             command=self.remove_selected_files,
-        ).pack(anchor="w", pady=(8, 0))
+            takefocus=True,
+        )
+        remove_button.pack(anchor="w", pady=(8, 0))
+        self._add_tooltip(
+            remove_button,
+            "Remove highlighted files from the session. The command palette also exposes this action.",
+        )
 
     def _init_columns_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Columns")
+        self.sub_tabs.setdefault("data", {})["columns"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         columns_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
@@ -899,11 +1493,17 @@ class FlowDataApp:
             anchor="w"
         )
 
+        self._add_info_blurb(
+            columns_tab,
+            "Check which files contribute each column. Keyboard focus stays in the table, so you can sort, scroll, and review coverage without using a mouse.",
+        )
+
         tree = ttk.Treeview(
             columns_tab,
             columns=("column", "files_present"),
             show="headings",
             height=18,
+            takefocus=True,
         )
         tree.heading("column", text="Column")
         tree.heading("files_present", text="Files containing column")
@@ -921,10 +1521,16 @@ class FlowDataApp:
     def _init_quality_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Data Quality")
+        self.sub_tabs.setdefault("data", {})["quality"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         quality_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         quality_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            quality_tab,
+            "Review inferred data types, missing values, and per-column notes to catch quality concerns early.",
+        )
 
         columns = (
             "column",
@@ -941,6 +1547,7 @@ class FlowDataApp:
             columns=columns,
             show="headings",
             height=16,
+            takefocus=True,
         )
         for name, label, width, anchor in [
             ("column", "Column", 220, "w"),
@@ -980,10 +1587,16 @@ class FlowDataApp:
     def _init_training_setup_tab(self, notebook: ttk.Notebook) -> None:
         setup_container = ttk.Frame(notebook)
         notebook.add(setup_container, text="Setup")
+        self.sub_tabs.setdefault("training", {})["setup"] = setup_container
         setup_scroll = ScrollableFrame(setup_container)
         setup_scroll.pack(fill="both", expand=True)
         setup_tab = ttk.Frame(setup_scroll.scrollable_frame, padding=12)
         setup_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            setup_tab,
+            "Choose features and targets, then press the training shortcuts to jump straight into model configuration.",
+        )
 
         feature_frame = ttk.LabelFrame(setup_tab, text="Feature Columns", padding=12)
         feature_frame.pack(fill="x", expand=False)
@@ -1025,16 +1638,28 @@ class FlowDataApp:
 
         button_row = ttk.Frame(feature_frame)
         button_row.pack(anchor="w", pady=(8, 0))
-        ttk.Button(
+        select_all_button = ttk.Button(
             button_row,
             text="Select All Common",
             command=self._select_all_common_features,
-        ).pack(side="left")
-        ttk.Button(
+            takefocus=True,
+        )
+        select_all_button.pack(side="left")
+        self._add_tooltip(
+            select_all_button,
+            "Automatically select columns that appear in every loaded file.",
+        )
+        clear_button = ttk.Button(
             button_row,
             text="Clear Selection",
             command=lambda: self.training_listbox.selection_clear(0, tk.END),
-        ).pack(side="left", padx=(8, 0))
+            takefocus=True,
+        )
+        clear_button.pack(side="left", padx=(8, 0))
+        self._add_tooltip(
+            clear_button,
+            "Clear the current feature selection.",
+        )
 
         ttk.Label(feature_frame, textvariable=self.training_hint_var).pack(
             anchor="w", pady=(8, 0)
@@ -1126,10 +1751,16 @@ class FlowDataApp:
     def _init_training_module_tab(self, notebook: ttk.Notebook) -> None:
         module_container = ttk.Frame(notebook)
         notebook.add(module_container, text="Training")
+        self.sub_tabs.setdefault("training", {})["module"] = module_container
         module_scroll = ScrollableFrame(module_container)
         module_scroll.pack(fill="both", expand=True)
         module_tab = ttk.Frame(module_scroll.scrollable_frame, padding=12)
         module_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            module_tab,
+            "Configure downsampling, training backends, and model metadata. Keyboard shortcuts jump here from anywhere in the app.",
+        )
 
         downsample_frame = ttk.LabelFrame(module_tab, text="Downsampling", padding=12)
         downsample_frame.pack(fill="both", expand=False, pady=(0, 12))
@@ -1168,11 +1799,17 @@ class FlowDataApp:
         )
         self.training_downsample_value_entry.pack(side="left", padx=(6, 12))
 
-        ttk.Button(
+        preview_button = ttk.Button(
             controls_row,
             text="Preview Downsampling",
             command=self._training_preview_downsampling,
-        ).pack(side="left")
+            takefocus=True,
+        )
+        preview_button.pack(side="left")
+        self._add_tooltip(
+            preview_button,
+            "Estimate resulting rows per file and class before training.",
+        )
 
         ttk.Label(
             downsample_frame,
@@ -1356,8 +1993,13 @@ class FlowDataApp:
             controls_frame,
             text="Train Model",
             command=self.start_training,
+            takefocus=True,
         )
         self.train_button.pack(side="left")
+        self._add_tooltip(
+            self.train_button,
+            "Begin model training using the configured parameters. Use the command palette or keyboard shortcuts to reach this button quickly.",
+        )
 
         self.training_progress = ttk.Progressbar(
             controls_frame,
@@ -1811,10 +2453,16 @@ class FlowDataApp:
     def _init_clustering_setup_tab(self, notebook: ttk.Notebook) -> None:
         module_container = ttk.Frame(notebook)
         notebook.add(module_container, text="Setup")
+        self.sub_tabs.setdefault("clustering", {})["setup"] = module_container
         module_scroll = ScrollableFrame(module_container)
         module_scroll.pack(fill="both", expand=True)
         module_tab = ttk.Frame(module_scroll.scrollable_frame, padding=12)
         module_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            module_tab,
+            "Define clustering inputs, optional filters, and balancing strategies. Keyboard shortcuts switch here instantly.",
+        )
 
         overview_frame = ttk.LabelFrame(module_tab, text="Dataset Overview", padding=12)
         overview_frame.pack(fill="x", expand=False)
@@ -1928,11 +2576,17 @@ class FlowDataApp:
         self.clustering_filter_min_var.set("")
         self.clustering_filter_max_var.set("")
 
-        ttk.Button(
+        add_filter_button = ttk.Button(
             subset_frame,
             text="Add filter",
             command=self._add_clustering_filter,
-        ).grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+            takefocus=True,
+        )
+        add_filter_button.grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        self._add_tooltip(
+            add_filter_button,
+            "Add the currently configured subset filter to the clustering pipeline.",
+        )
 
         self.clustering_filter_tree = ttk.Treeview(
             subset_frame,
@@ -1953,11 +2607,17 @@ class FlowDataApp:
         subset_frame.grid_columnconfigure(2, weight=1)
         subset_frame.grid_columnconfigure(3, weight=0)
 
-        ttk.Button(
+        remove_filter_button = ttk.Button(
             subset_frame,
             text="Remove selected",
             command=self._remove_selected_clustering_filter,
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            takefocus=True,
+        )
+        remove_filter_button.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self._add_tooltip(
+            remove_filter_button,
+            "Remove highlighted subset filters.",
+        )
         self._refresh_clustering_filter_tree()
 
         feature_frame = ttk.LabelFrame(
@@ -2202,10 +2862,16 @@ class FlowDataApp:
     def _init_clustering_results_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Results")
+        self.sub_tabs.setdefault("clustering", {})["results"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         results_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         results_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            results_tab,
+            "Summaries for each clustering algorithm, including timing, parameters, and cluster counts.",
+        )
 
         summary_frame = ttk.Frame(results_tab)
         summary_frame.pack(fill="x")
@@ -2254,10 +2920,16 @@ class FlowDataApp:
     def _init_clustering_visuals_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Visualization")
+        self.sub_tabs.setdefault("clustering", {})["visuals"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         viz_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         viz_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            viz_tab,
+            "Launch UMAP projections and heatmaps to interpret clustering outcomes.",
+        )
 
         # UMAP controls
         umap_frame = ttk.LabelFrame(viz_tab, text="UMAP Projection", padding=12)
@@ -2560,10 +3232,16 @@ class FlowDataApp:
     def _init_clustering_explorer_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Cluster Explorer")
+        self.sub_tabs.setdefault("clustering", {})["explorer"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         explorer_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         explorer_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            explorer_tab,
+            "Interactively review clusters, select subsets, and trigger marker visualizations from the keyboard.",
+        )
 
         controls = ttk.LabelFrame(explorer_tab, text="Explorer Controls", padding=12)
         controls.pack(fill="x", expand=False)
@@ -3326,10 +4004,16 @@ class FlowDataApp:
     def _init_clustering_annotation_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Annotation Wizard")
+        self.sub_tabs.setdefault("clustering", {})["annotation"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         annotation_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         annotation_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            annotation_tab,
+            "Iteratively label clusters, manage annotation columns, and export curated tables for reporting.",
+        )
 
         controls = ttk.LabelFrame(annotation_tab, text="Annotation Controls", padding=12)
         controls.pack(fill="x", expand=False)
@@ -3418,10 +4102,16 @@ class FlowDataApp:
     def _init_clustering_comparison_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Cluster Comparison")
+        self.sub_tabs.setdefault("clustering", {})["comparison"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         comparison_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         comparison_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            comparison_tab,
+            "Evaluate how clustering solutions align with existing categories, including composition charts and Sankey plots.",
+        )
 
         controls = ttk.LabelFrame(comparison_tab, text="Comparison Controls", padding=12)
         controls.pack(fill="x", expand=False)
@@ -4149,10 +4839,16 @@ class FlowDataApp:
     def _init_training_visuals_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Visualizations")
+        self.sub_tabs.setdefault("training", {})["visuals"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         visuals_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         visuals_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            visuals_tab,
+            "Visualize coverage, class balance, and evaluation plots to validate model readiness.",
+        )
 
         coverage_frame = ttk.LabelFrame(
             visuals_tab, text="Column coverage across files", padding=8
@@ -4227,10 +4923,16 @@ class FlowDataApp:
     def _init_results_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Results")
+        self.sub_tabs.setdefault("training", {})["results"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         results_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         results_tab.pack(fill="both", expand=True)
+
+        self._add_info_blurb(
+            results_tab,
+            "Review evaluation metrics, reports, and confusion matrices after each training run.",
+        )
 
         metrics_frame = ttk.LabelFrame(
             results_tab, text="Evaluation Summary", padding=8
@@ -4331,21 +5033,16 @@ class FlowDataApp:
     def _init_run_registry_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
         notebook.add(container, text="Run Registry")
+        self.sub_tabs.setdefault("training", {})["runs"] = container
         scroll = ScrollableFrame(container)
         scroll.pack(fill="both", expand=True)
         registry_tab = ttk.Frame(scroll.scrollable_frame, padding=12)
         registry_tab.pack(fill="both", expand=True)
 
-        ttk.Label(
+        self._add_info_blurb(
             registry_tab,
-            text=(
-                "Each completed training run is captured here with accuracy, configuration, "
-                "and any tags/notes you supply. Select a run to view details or restore "
-                "its configuration."
-            ),
-            wraplength=800,
-            justify="left",
-        ).pack(anchor="w", pady=(0, 8))
+            "Review historical training runs, restore configurations, and capture audit trails for experimentation.",
+        )
 
         columns = ("timestamp", "model", "target", "accuracy", "tags")
         tree = ttk.Treeview(
@@ -4353,6 +5050,7 @@ class FlowDataApp:
             columns=columns,
             show="headings",
             height=12,
+            takefocus=True,
         )
         tree.heading("timestamp", text="Timestamp")
         tree.heading("model", text="Model")
@@ -4386,11 +5084,17 @@ class FlowDataApp:
 
         button_row = ttk.Frame(detail_frame)
         button_row.pack(fill="x", pady=(6, 0))
-        ttk.Button(
+        restore_button = ttk.Button(
             button_row,
             text="Restore Configuration",
             command=self._restore_selected_run,
-        ).pack(side="left")
+            takefocus=True,
+        )
+        restore_button.pack(side="left")
+        self._add_tooltip(
+            restore_button,
+            "Apply the parameters from the selected run back to the training setup tab.",
+        )
 
     def _load_run_registry(self) -> None:
         try:
