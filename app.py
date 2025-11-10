@@ -56,6 +56,19 @@ try:
 except ImportError:
     sparse = None  # type: ignore[assignment]
 
+from model_wrappers import (
+    BalancePayload,
+    TrainResult,
+    apply_smote,
+    class_weight_sample_array,
+    compute_class_weight_dict,
+    focal_sample_weight_array,
+    train_lightgbm,
+    train_logistic_regression,
+    train_naive_bayes,
+    train_xgboost,
+)
+
 if TYPE_CHECKING:
     from scipy.sparse import csr_matrix as CSRMatrix  # type: ignore[import]
 else:  # pragma: no cover - runtime fallback when SciPy is unavailable
@@ -432,6 +445,7 @@ class FlowDataApp:
         self.nn_weight_decay_var = tk.DoubleVar(value=0.0)
         self.nn_use_gpu_var = tk.BooleanVar(value=True)
         self.class_balance_var = tk.StringVar(value="None")
+        self.calibration_var = tk.StringVar(value="None")
         self.run_tags_var = tk.StringVar(value="")
         self.run_notes_var = tk.StringVar(value="")
         self.lr_solver_var = tk.StringVar(value="lbfgs")
@@ -452,7 +466,28 @@ class FlowDataApp:
         self.lgb_subsample_var = tk.DoubleVar(value=0.8)
         self.keep_rf_oob_var = tk.BooleanVar(value=True)
         self.training_model_description_var = tk.StringVar(value="")
-        self.class_balance_var.trace_add("write", lambda *_: self._mark_session_dirty())
+        self.class_balance_var.trace_add("write", self._on_class_balance_changed)
+        self.calibration_var.trace_add("write", self._on_calibration_changed)
+        self.model_balance_options = {
+            "Random Forest": ["None", "Class Weights", "Focal Loss"],
+            "LDA": ["None"],
+            "SVM": ["None", "Class Weights", "Focal Loss"],
+            "Logistic Regression": ["None", "Class Weights", "Focal Loss", "SMOTE"],
+            "Naive Bayes": ["None", "Class Weights", "Focal Loss", "SMOTE"],
+            "XGBoost": ["None", "Class Weights", "Focal Loss", "SMOTE"],
+            "LightGBM": ["None", "Class Weights", "Focal Loss", "SMOTE"],
+            "KMeans": ["None"],
+            "Neural Network": ["None", "Class Weights", "Focal Loss"],
+        }
+        self.balance_state_per_model = {
+            name: options[0] for name, options in self.model_balance_options.items()
+        }
+        self.model_calibration_options = {
+            "Logistic Regression": ["None", "Platt (sigmoid)", "Isotonic"],
+            "Naive Bayes": ["None", "Platt (sigmoid)", "Isotonic"],
+            "XGBoost": ["None", "Platt (sigmoid)", "Isotonic"],
+            "LightGBM": ["None", "Platt (sigmoid)", "Isotonic"],
+        }
         self.training_model_configs = {
             "Random Forest": {
                 "key": "rf",
@@ -499,6 +534,11 @@ class FlowDataApp:
                 "type": "supervised",
                 "description": "Feed-forward neural network (PyTorch) with configurable hidden layers and optional GPU acceleration.",
             },
+        }
+        default_calibration = ["None"]
+        self.calibration_state_per_model = {
+            name: self.model_calibration_options.get(name, default_calibration)[0]
+            for name in self.training_model_configs
         }
 
         # Clustering module state
@@ -1313,13 +1353,25 @@ class FlowDataApp:
         ttk.Label(eval_frame, text="Class balance").grid(
             row=0, column=3, sticky="w", padx=(12, 0)
         )
-        ttk.Combobox(
+        self.class_balance_combo = ttk.Combobox(
             eval_frame,
             state="readonly",
-            values=["None", "Balanced"],
+            values=self.model_balance_options.get(self.training_model_var.get(), ["None"]),
             textvariable=self.class_balance_var,
-            width=12,
-        ).grid(row=1, column=3, sticky="w", padx=(12, 0))
+            width=14,
+        )
+        self.class_balance_combo.grid(row=1, column=3, sticky="w", padx=(12, 0))
+        ttk.Label(eval_frame, text="Calibration").grid(
+            row=0, column=4, sticky="w", padx=(12, 0)
+        )
+        self.calibration_combo = ttk.Combobox(
+            eval_frame,
+            state="readonly",
+            values=self.model_calibration_options.get(self.training_model_var.get(), ["None"]),
+            textvariable=self.calibration_var,
+            width=14,
+        )
+        self.calibration_combo.grid(row=1, column=4, sticky="w", padx=(12, 0))
 
         run_meta_frame = ttk.Frame(training_frame)
         run_meta_frame.pack(fill="x", pady=(8, 0))
@@ -1803,9 +1855,55 @@ class FlowDataApp:
         frame = self.training_model_param_frames.get(selected)
         if frame is not None:
             frame.pack(fill="x", pady=(4, 0))
+        self._update_balance_and_calibration_controls(selected)
 
     def _handle_training_model_selected(self, _event: Optional[tk.Event] = None) -> None:
         self._on_training_model_changed()
+        self._mark_session_dirty()
+
+    def _update_balance_and_calibration_controls(self, model_name: str) -> None:
+        balance_options = self.model_balance_options.get(model_name, ["None"])
+        self.class_balance_combo.configure(values=balance_options)
+        stored_balance = self.balance_state_per_model.get(model_name, balance_options[0])
+        if stored_balance not in balance_options:
+            stored_balance = balance_options[0]
+        if self.class_balance_var.get() != stored_balance:
+            self.class_balance_var.set(stored_balance)
+        calibration_options = self.model_calibration_options.get(model_name, ["None"])
+        self.calibration_combo.configure(values=calibration_options)
+        stored_calibration = self.calibration_state_per_model.get(
+            model_name, calibration_options[0]
+        )
+        if stored_calibration not in calibration_options:
+            stored_calibration = calibration_options[0]
+        if self.calibration_var.get() != stored_calibration:
+            self.calibration_var.set(stored_calibration)
+        if len(calibration_options) == 1:
+            self.calibration_combo.configure(state="disabled")
+            self.calibration_var.set(calibration_options[0])
+        else:
+            self.calibration_combo.configure(state="readonly")
+
+    def _on_class_balance_changed(self, *_args: object) -> None:
+        model = self.training_model_var.get()
+        if model:
+            value = self.class_balance_var.get()
+            options = self.model_balance_options.get(model, ["None"])
+            if value not in options:
+                value = options[0]
+                self.class_balance_var.set(value)
+            self.balance_state_per_model[model] = value
+        self._mark_session_dirty()
+
+    def _on_calibration_changed(self, *_args: object) -> None:
+        model = self.training_model_var.get()
+        if model:
+            value = self.calibration_var.get()
+            options = self.model_calibration_options.get(model, ["None"])
+            if value not in options:
+                value = options[0]
+                self.calibration_var.set(value)
+            self.calibration_state_per_model[model] = value
         self._mark_session_dirty()
 
     def _init_clustering_setup_tab(self, notebook: ttk.Notebook) -> None:
@@ -4449,6 +4547,7 @@ class FlowDataApp:
             f"Accuracy: {record.get('accuracy'):.3f}" if isinstance(record.get('accuracy'), (int, float)) else "Accuracy: -",
             f"Macro F1: {record.get('f1_macro'):.3f}" if isinstance(record.get('f1_macro'), (int, float)) else "Macro F1: -",
             f"Class balance: {record.get('class_balance', 'None')}",
+            f"Calibration: {record.get('calibration', 'None')}",
             f"Tags: {', '.join(record.get('tags', [])) or '-'}",
             f"Notes: {record.get('notes') or '-'}",
             f"Features ({len(record.get('features', []))}): {', '.join(record.get('features', [])[:25])}" + ("…" if len(record.get('features', [])) > 25 else ""),
@@ -4499,6 +4598,9 @@ class FlowDataApp:
             self.training_model_var.set(model_name)
             self._on_training_model_changed()
             self._apply_model_params(model_name, record.get("model_params", {}))
+        calibration = record.get("calibration")
+        if calibration:
+            self.calibration_var.set(calibration)
         self._mark_session_dirty()
 
     def _apply_model_params(self, model_name: str, params: Dict[str, object]) -> None:
@@ -4538,6 +4640,7 @@ class FlowDataApp:
 
     def _record_training_run(self, payload: Dict[str, object]) -> None:
         metrics = payload.get("metrics", {})
+        config = payload.get("config", {})
         record = {
             "id": uuid.uuid4().hex,
             "timestamp": time.time(),
@@ -4547,7 +4650,8 @@ class FlowDataApp:
             "accuracy": metrics.get("accuracy"),
             "f1_macro": metrics.get("f1_macro"),
             "model_params": payload.get("config", {}).get("model_params", {}),
-            "class_balance": self.class_balance_var.get(),
+            "class_balance": config.get("balance_strategy", self.class_balance_var.get()),
+            "calibration": config.get("calibration", self.calibration_var.get()),
             "tags": self._parse_tags(self.run_tags_var.get()),
             "notes": self.run_notes_var.get().strip(),
             "seed": RANDOM_STATE,
@@ -6691,22 +6795,44 @@ class FlowDataApp:
         )
         return pd.read_parquet(cache_path)
 
-    @staticmethod
-    def _compute_class_weight_dict(y: pd.Series) -> Dict[object, float]:
-        counts = y.value_counts(dropna=False)
-        total = len(y)
-        n_classes = len(counts)
-        weights: Dict[object, float] = {}
-        for cls, count in counts.items():
-            if count == 0:
-                continue
-            weights[cls] = total / (n_classes * count)
-        return weights
-
-    @staticmethod
-    def _sample_weight_array(y: pd.Series, class_weights: Dict[object, float]) -> np.ndarray:
-        mapped = y.map(class_weights).astype(float)
-        return mapped.to_numpy(dtype=float, copy=False)
+    def _prepare_balance_payload(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        strategy: str,
+    ) -> BalancePayload:
+        if strategy == "Class Weights":
+            class_weights = compute_class_weight_dict(y_train)
+            sample_weight = class_weight_sample_array(y_train, class_weights)
+            return BalancePayload(
+                X_train=X_train,
+                y_train=y_train,
+                strategy=strategy,
+                class_weights=class_weights,
+                sample_weight=sample_weight,
+            )
+        if strategy == "Focal Loss":
+            class_weights = compute_class_weight_dict(y_train)
+            sample_weight = focal_sample_weight_array(y_train, class_weights)
+            return BalancePayload(
+                X_train=X_train,
+                y_train=y_train,
+                strategy=strategy,
+                class_weights=None,
+                sample_weight=sample_weight,
+            )
+        if strategy == "SMOTE":
+            X_balanced, y_balanced = apply_smote(X_train, y_train, RANDOM_STATE)
+            if isinstance(X_balanced, np.ndarray):
+                X_balanced = pd.DataFrame(X_balanced, columns=X_train.columns)
+            if isinstance(y_balanced, np.ndarray):
+                y_balanced = pd.Series(y_balanced, name=y_train.name)
+            return BalancePayload(
+                X_train=X_balanced,
+                y_train=y_balanced,
+                strategy=strategy,
+            )
+        return BalancePayload(X_train=X_train, y_train=y_train, strategy="None")
 
     def _reset_results_view(self) -> None:
         if not hasattr(self, "metrics_text"):
@@ -7196,6 +7322,8 @@ class FlowDataApp:
             n_jobs = self.total_cpu_cores
         self.n_jobs_var.set(n_jobs)
 
+        balance_strategy = self.class_balance_var.get()
+        calibration_method = self.calibration_var.get()
         config = {
             "model_name": model_name,
             "model_params": model_params,
@@ -7204,6 +7332,8 @@ class FlowDataApp:
             "n_jobs": n_jobs,
             "features": list(self.training_selection),
             "target": target_column,
+            "balance_strategy": balance_strategy,
+            "calibration": calibration_method,
         }
 
         self.training_results = {}
@@ -7261,18 +7391,31 @@ class FlowDataApp:
                     stratify=None,
                 )
 
-            class_balance_mode = self.class_balance_var.get()
-            class_weight_dict: Optional[Dict[object, float]] = None
-            fit_sample_weight: Optional[np.ndarray] = None
-            if class_balance_mode != "None" and len(y_train) > 0:
-                class_weight_dict = self._compute_class_weight_dict(y_train)
-                fit_sample_weight = self._sample_weight_array(y_train, class_weight_dict)
+            balance_strategy = str(config.get("balance_strategy", self.class_balance_var.get()))
+            available_balances = self.model_balance_options.get(model_name, ["None"])
+            if balance_strategy not in available_balances:
+                balance_strategy = available_balances[0]
+            calibration_method = str(config.get("calibration", self.calibration_var.get()))
+            available_calibrations = self.model_calibration_options.get(model_name, ["None"])
+            if calibration_method not in available_calibrations:
+                calibration_method = available_calibrations[0]
+            if len(y_train) == 0:
+                balance_strategy = "None"
+            balance_payload = self._prepare_balance_payload(X_train, y_train, balance_strategy)
+            class_weight_dict: Optional[Dict[object, float]] = (
+                balance_payload.class_weights if balance_strategy == "Class Weights" else None
+            )
+            fit_sample_weight: Optional[np.ndarray] = (
+                balance_payload.sample_weight
+                if balance_strategy in {"Class Weights", "Focal Loss"}
+                else None
+            )
 
             if model_name == "Random Forest":
                 payload = self._train_random_forest_model(
-                    X_train,
+                    balance_payload.X_train,
                     X_test,
-                    y_train,
+                    balance_payload.y_train,
                     y_test,
                     params,
                     cv_folds,
@@ -7282,9 +7425,9 @@ class FlowDataApp:
                 )
             elif model_name == "LDA":
                 payload = self._train_lda_model(
-                    X_train,
+                    balance_payload.X_train,
                     X_test,
-                    y_train,
+                    balance_payload.y_train,
                     y_test,
                     params,
                     cv_folds,
@@ -7293,9 +7436,9 @@ class FlowDataApp:
                 )
             elif model_name == "SVM":
                 payload = self._train_svm_model(
-                    X_train,
+                    balance_payload.X_train,
                     X_test,
-                    y_train,
+                    balance_payload.y_train,
                     y_test,
                     params,
                     cv_folds,
@@ -7305,54 +7448,55 @@ class FlowDataApp:
                 )
             elif model_name == "Logistic Regression":
                 payload = self._train_logistic_regression_model(
-                    X_train,
+                    balance_payload,
                     X_test,
-                    y_train,
                     y_test,
                     params,
                     cv_folds,
                     n_jobs,
-                    class_weight_dict,
-                    fit_sample_weight,
+                    calibration_method,
                 )
             elif model_name == "Naive Bayes":
                 payload = self._train_naive_bayes_model(
-                    X_train,
+                    balance_payload,
                     X_test,
-                    y_train,
                     y_test,
                     params,
-                    fit_sample_weight,
+                    calibration_method,
+                    cv_folds,
+                    n_jobs,
                 )
             elif model_name == "XGBoost":
                 payload = self._train_xgboost_model(
-                    X_train,
+                    balance_payload,
                     X_test,
-                    y_train,
                     y_test,
                     params,
-                    class_weight_dict,
-                    fit_sample_weight,
+                    calibration_method,
                     n_jobs,
                 )
             elif model_name == "LightGBM":
                 payload = self._train_lightgbm_model(
-                    X_train,
+                    balance_payload,
                     X_test,
-                    y_train,
                     y_test,
                     params,
-                    class_weight_dict,
-                    fit_sample_weight,
+                    calibration_method,
                     n_jobs,
                 )
             elif model_name == "KMeans":
-                payload = self._train_kmeans_model(X_train, X_test, y_train, y_test, params)
+                payload = self._train_kmeans_model(
+                    balance_payload.X_train,
+                    X_test,
+                    balance_payload.y_train,
+                    y_test,
+                    params,
+                )
             elif model_name == "Neural Network":
                 payload = self._train_neural_network_model(
-                    X_train,
+                    balance_payload.X_train,
                     X_test,
-                    y_train,
+                    balance_payload.y_train,
                     y_test,
                     params,
                     class_weight_dict,
@@ -7374,6 +7518,8 @@ class FlowDataApp:
                 "test_size": test_size,
                 "cv_folds": cv_folds,
                 "n_jobs": n_jobs,
+                "balance_strategy": balance_strategy,
+                "calibration": calibration_method,
             }
             self.training_queue.put({"status": "success", "payload": payload})
         except Exception as exc:  # noqa: BLE001
@@ -7549,168 +7695,183 @@ class FlowDataApp:
 
     def _train_logistic_regression_model(
         self,
-        X_train,
-        X_test,
-        y_train,
-        y_test,
+        balance_payload: BalancePayload,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
         params: Dict[str, object],
         cv_folds: int,
         n_jobs: int,
-        class_weights: Optional[Dict[object, float]] = None,
-        sample_weight: Optional[np.ndarray] = None,
+        calibration: str,
     ) -> Dict[str, object]:
-        lr_kwargs = {
-            "solver": params["solver"],
-            "penalty": params["penalty"],
-            "C": params["C"],
-            "max_iter": params["max_iter"],
-            "class_weight": class_weights,
-            "n_jobs": n_jobs,
-            "random_state": RANDOM_STATE,
-        }
-        if params["penalty"] == "elasticnet":
-            lr_kwargs["l1_ratio"] = params.get("l1_ratio", 0.5)
-        model = Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("logreg", LogisticRegression(**lr_kwargs)),
-            ]
+        lr_params = dict(params)
+        lr_params.setdefault("random_state", RANDOM_STATE)
+        result = train_logistic_regression(
+            balance_payload.X_train,
+            X_test,
+            balance_payload.y_train,
+            lr_params,
+            balance_payload,
+            calibration,
+            cv_folds,
+            n_jobs,
         )
-        fit_kwargs = {}
-        if sample_weight is not None:
-            fit_kwargs["logreg__sample_weight"] = sample_weight
-        model.fit(X_train, y_train, **fit_kwargs)
-        predictions = model.predict(X_test)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
-        cv_scores, cv_warning = self._perform_cross_validation(model, X_train, y_train, cv_folds, n_jobs)
+        metrics, conf_matrix, classes = self._classification_metrics(
+            y_test, result.predictions
+        )
+        cv_scores, cv_warning = self._perform_cross_validation(
+            result.cv_estimator,
+            balance_payload.X_train,
+            balance_payload.y_train,
+            cv_folds,
+            n_jobs,
+        )
+        artifacts: Dict[str, object] = {}
+        if result.probabilities is not None:
+            artifacts["probabilities"] = result.probabilities
         return {
-            "model": model,
+            "model": result.model,
             "metrics": metrics,
             "confusion_matrix": conf_matrix,
             "classes": classes,
             "feature_importances": [],
-            "train_rows": len(X_train),
+            "train_rows": len(balance_payload.X_train),
             "test_rows": len(X_test),
             "cv_scores": cv_scores,
             "cv_warning": cv_warning,
-            "artifacts": {},
+            "artifacts": artifacts,
         }
 
     def _train_naive_bayes_model(
         self,
-        X_train,
-        X_test,
-        y_train,
-        y_test,
+        balance_payload: BalancePayload,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
         params: Dict[str, object],
-        sample_weight: Optional[np.ndarray] = None,
+        calibration: str,
+        cv_folds: int,
+        n_jobs: int,
     ) -> Dict[str, object]:
-        model = GaussianNB(var_smoothing=params["var_smoothing"])
-        fit_kwargs = {}
-        if sample_weight is not None:
-            fit_kwargs["sample_weight"] = sample_weight
-        model.fit(X_train, y_train, **fit_kwargs)
-        predictions = model.predict(X_test)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
+        result = train_naive_bayes(
+            balance_payload.X_train,
+            X_test,
+            balance_payload.y_train,
+            params,
+            balance_payload,
+            calibration,
+            cv_folds,
+            n_jobs,
+        )
+        metrics, conf_matrix, classes = self._classification_metrics(
+            y_test, result.predictions
+        )
+        cv_scores, cv_warning = self._perform_cross_validation(
+            result.cv_estimator,
+            balance_payload.X_train,
+            balance_payload.y_train,
+            cv_folds,
+            n_jobs,
+        )
+        artifacts: Dict[str, object] = {}
+        if result.probabilities is not None:
+            artifacts["probabilities"] = result.probabilities
         return {
-            "model": model,
+            "model": result.model,
             "metrics": metrics,
             "confusion_matrix": conf_matrix,
             "classes": classes,
             "feature_importances": [],
-            "train_rows": len(X_train),
+            "train_rows": len(balance_payload.X_train),
             "test_rows": len(X_test),
-            "cv_scores": None,
-            "cv_warning": "",
-            "artifacts": {},
+            "cv_scores": cv_scores,
+            "cv_warning": cv_warning,
+            "artifacts": artifacts,
         }
 
     def _train_xgboost_model(
         self,
-        X_train,
-        X_test,
-        y_train,
-        y_test,
+        balance_payload: BalancePayload,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
         params: Dict[str, object],
-        class_weights: Optional[Dict[object, float]],
-        sample_weight: Optional[np.ndarray],
+        calibration: str,
         n_jobs: int,
     ) -> Dict[str, object]:
-        if XGBClassifier is None:
-            raise ValueError("Install the 'xgboost' package to use this model.")
-        X_train_np = X_train.to_numpy(dtype=np.float32, copy=False)
-        X_test_np = X_test.to_numpy(dtype=np.float32, copy=False)
-        num_classes = y_train.nunique()
-        objective = "multi:softprob" if num_classes > 2 else "binary:logistic"
-        model = XGBClassifier(
-            n_estimators=params["n_estimators"],
-            learning_rate=params["learning_rate"],
-            max_depth=params["max_depth"],
-            subsample=params["subsample"],
-            colsample_bytree=params["colsample_bytree"],
-            objective=objective,
-            eval_metric="mlogloss",
-            n_jobs=n_jobs,
-            random_state=RANDOM_STATE,
-            tree_method="hist",
+        xgb_params = dict(params)
+        xgb_params.setdefault("random_state", RANDOM_STATE)
+        result = train_xgboost(
+            balance_payload.X_train,
+            X_test,
+            balance_payload.y_train,
+            xgb_params,
+            balance_payload,
+            calibration,
+            n_jobs,
         )
-        model.fit(X_train_np, y_train, sample_weight=sample_weight)
-        predictions = model.predict(X_test_np)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
-        feature_importances = list(model.feature_importances_.tolist()) if hasattr(model, "feature_importances_") else []
+        metrics, conf_matrix, classes = self._classification_metrics(
+            y_test, result.predictions
+        )
+        feature_importances: List[float] = []
+        model = result.model
+        if hasattr(model, "feature_importances_"):
+            importances = getattr(model, "feature_importances_")
+            feature_importances = list(np.asarray(importances).tolist())
+        artifacts: Dict[str, object] = {}
+        if result.probabilities is not None:
+            artifacts["probabilities"] = result.probabilities
         return {
             "model": model,
             "metrics": metrics,
             "confusion_matrix": conf_matrix,
             "classes": classes,
             "feature_importances": feature_importances,
-            "train_rows": len(X_train),
+            "train_rows": len(balance_payload.X_train),
             "test_rows": len(X_test),
             "cv_scores": None,
             "cv_warning": "",
-            "artifacts": {},
+            "artifacts": artifacts,
         }
 
     def _train_lightgbm_model(
         self,
-        X_train,
-        X_test,
-        y_train,
-        y_test,
+        balance_payload: BalancePayload,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
         params: Dict[str, object],
-        class_weights: Optional[Dict[object, float]],
-        sample_weight: Optional[np.ndarray],
+        calibration: str,
         n_jobs: int,
     ) -> Dict[str, object]:
-        if lgb is None:
-            raise ValueError("Install the 'lightgbm' package to use this model.")
-        X_train_np = X_train.to_numpy(dtype=np.float32, copy=False)
-        X_test_np = X_test.to_numpy(dtype=np.float32, copy=False)
-        model = lgb.LGBMClassifier(
-            n_estimators=params["n_estimators"],
-            learning_rate=params["learning_rate"],
-            max_depth=params["max_depth"],
-            num_leaves=params["num_leaves"],
-            subsample=params["subsample"],
-            class_weight=class_weights,
-            n_jobs=n_jobs,
-            random_state=RANDOM_STATE,
+        lgb_params = dict(params)
+        lgb_params.setdefault("random_state", RANDOM_STATE)
+        result = train_lightgbm(
+            balance_payload.X_train,
+            X_test,
+            balance_payload.y_train,
+            lgb_params,
+            balance_payload,
+            calibration,
+            n_jobs,
         )
-        model.fit(X_train_np, y_train, sample_weight=sample_weight)
-        predictions = model.predict(X_test_np)
-        metrics, conf_matrix, classes = self._classification_metrics(y_test, predictions)
-        feature_importances = list(model.feature_importances_.tolist()) if hasattr(model, "feature_importances_") else []
+        metrics, conf_matrix, classes = self._classification_metrics(
+            y_test, result.predictions
+        )
+        feature_importances: List[float] = []
+        model = result.model
+        if hasattr(model, "feature_importances_"):
+            feature_importances = list(np.asarray(model.feature_importances_).tolist())
+        artifacts: Dict[str, object] = {}
+        if result.probabilities is not None:
+            artifacts["probabilities"] = result.probabilities
         return {
             "model": model,
             "metrics": metrics,
             "confusion_matrix": conf_matrix,
             "classes": classes,
             "feature_importances": feature_importances,
-            "train_rows": len(X_train),
+            "train_rows": len(balance_payload.X_train),
             "test_rows": len(X_test),
             "cv_scores": None,
             "cv_warning": "",
-            "artifacts": {},
+            "artifacts": artifacts,
         }
 
     def _build_cluster_label_map(self, clusters: np.ndarray, labels: pd.Series) -> tuple[Dict[int, object], object]:
@@ -8442,12 +8603,21 @@ class FlowDataApp:
             self.target_column_var.set(target)
             self.on_target_column_selected()
         balance = state.get("class_balance")
-        if balance:
-            self.class_balance_var.set(balance)
+        if isinstance(state.get("balance_states"), dict):
+            self.balance_state_per_model.update(state.get("balance_states", {}))
+        if isinstance(state.get("calibration_states"), dict):
+            self.calibration_state_per_model.update(
+                state.get("calibration_states", {})
+            )
         model = state.get("model")
         if model and model in self.training_model_configs:
             self.training_model_var.set(model)
             self._on_training_model_changed()
+        if balance:
+            self.class_balance_var.set(balance)
+        calibration = state.get("calibration")
+        if calibration:
+            self.calibration_var.set(calibration)
         self._mark_session_dirty()
 
     def _mark_session_dirty(self) -> None:
@@ -8468,6 +8638,9 @@ class FlowDataApp:
                 "target": self.target_column_var.get(),
                 "model": self.training_model_var.get(),
                 "class_balance": self.class_balance_var.get(),
+                "calibration": self.calibration_var.get(),
+                "balance_states": dict(self.balance_state_per_model),
+                "calibration_states": dict(self.calibration_state_per_model),
             },
         }
         try:
