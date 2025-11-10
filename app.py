@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -34,6 +34,7 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from annotation_ontology import AnnotationOntology
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -756,6 +757,19 @@ class FlowDataApp:
         self.current_annotation_columns: List[str] = ["cluster"]
         self.annotation_edit_widget: Optional[ttk.Combobox] = None
         self.annotation_edit_info: Optional[Dict[str, Any]] = None
+        self.annotation_ontology = AnnotationOntology()
+        self.cluster_marker_profiles: Dict[str, Dict[str, Dict[str, float]]] = {}
+        self.annotation_recipe_var = tk.StringVar()
+        self.annotation_recipe_description_var = tk.StringVar(value="")
+        self.annotation_suggestion_var = tk.StringVar(
+            value="Select a cluster to preview marker-driven suggestions."
+        )
+        self.annotation_shortcut_var = tk.StringVar(
+            value=(
+                "Shortcuts: Enter to edit, Ctrl+Space inserts top suggestion, "
+                "Ctrl+↑/↓ cycles suggestions, Ctrl+R applies selected recipe."
+            )
+        )
         self.cluster_compare_method_var = tk.StringVar()
         self.cluster_compare_category_var = tk.StringVar()
         self.cluster_compare_category_map: Dict[str, tuple[str, str]] = {}
@@ -3336,6 +3350,7 @@ class FlowDataApp:
         controls.grid_columnconfigure(0, weight=0)
         controls.grid_columnconfigure(1, weight=1)
         controls.grid_columnconfigure(2, weight=0)
+        controls.grid_columnconfigure(3, weight=0)
 
         ttk.Label(controls, text="Clustering run").grid(row=0, column=0, sticky="w")
         self.cluster_annotation_method_combo = ttk.Combobox(
@@ -3372,7 +3387,63 @@ class FlowDataApp:
             controls,
             text="Save Annotation Table…",
             command=self._save_annotation_table,
-        ).grid(row=1, column=2, sticky="e")
+        ).grid(row=1, column=3, sticky="e")
+
+        quick_actions = ttk.LabelFrame(annotation_tab, text="Quick Recipes & Shortcuts", padding=12)
+        quick_actions.pack(fill="x", expand=False, pady=(12, 0))
+        quick_actions.grid_columnconfigure(0, weight=0)
+        quick_actions.grid_columnconfigure(1, weight=0)
+        quick_actions.grid_columnconfigure(2, weight=1)
+
+        ttk.Label(quick_actions, text="Recipe").grid(row=0, column=0, sticky="w")
+        self.annotation_recipe_combo = ttk.Combobox(
+            quick_actions,
+            textvariable=self.annotation_recipe_var,
+            state="readonly",
+            width=32,
+            values=[],
+        )
+        self.annotation_recipe_combo.grid(row=1, column=0, sticky="w")
+        self.annotation_recipe_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._update_annotation_recipe_description()
+        )
+
+        ttk.Button(
+            quick_actions,
+            text="Apply to Selected (Ctrl+R)",
+            command=self._apply_selected_annotation_recipe,
+        ).grid(row=1, column=1, sticky="w", padx=(12, 0))
+
+        ttk.Button(
+            quick_actions,
+            text="Save Selection as Recipe…",
+            command=self._save_selection_as_recipe,
+        ).grid(row=1, column=2, sticky="w", padx=(12, 0))
+
+        ttk.Label(
+            quick_actions,
+            textvariable=self.annotation_recipe_description_var,
+            foreground="#555555",
+            wraplength=780,
+            justify="left",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        ttk.Label(
+            quick_actions,
+            textvariable=self.annotation_shortcut_var,
+            foreground="#666666",
+            wraplength=780,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        suggestion_box = ttk.LabelFrame(annotation_tab, text="Suggestion Preview", padding=12)
+        suggestion_box.pack(fill="x", expand=False, pady=(12, 6))
+        ttk.Label(
+            suggestion_box,
+            textvariable=self.annotation_suggestion_var,
+            wraplength=780,
+            justify="left",
+        ).pack(anchor="w")
 
         ttk.Label(
             annotation_tab,
@@ -3388,12 +3459,15 @@ class FlowDataApp:
             tree_frame,
             columns=("cluster",),
             show="headings",
-            selectmode="browse",
+            selectmode="extended",
         )
         self.annotation_tree.heading("cluster", text="Cluster")
         self.annotation_tree.column("cluster", width=160, anchor="center")
         self.annotation_tree.pack(side="left", fill="both", expand=True)
         self.annotation_tree.bind("<Double-1>", self._on_annotation_cell_double_click)
+        self.annotation_tree.bind("<<TreeviewSelect>>", lambda _e: self._update_annotation_suggestion_preview())
+        self.annotation_tree.bind("<Return>", self._start_annotation_edit_from_shortcut)
+        self.annotation_tree.bind("<Control-r>", lambda _e: self._apply_selected_annotation_recipe())
 
         annotation_scroll_y = ttk.Scrollbar(
             tree_frame, orient="vertical", command=self.annotation_tree.yview
@@ -3413,6 +3487,7 @@ class FlowDataApp:
             foreground="#666666",
         ).pack(anchor="w", pady=(6, 0))
         self._refresh_annotation_method_choices()
+        self._refresh_annotation_recipe_choices()
         self._refresh_cluster_comparison_controls()
 
     def _init_clustering_comparison_tab(self, notebook: ttk.Notebook) -> None:
@@ -3515,6 +3590,9 @@ class FlowDataApp:
             )
             self.cluster_annotation_status_var.set("")
             self.current_annotation_columns = ["cluster"]
+            self.annotation_suggestion_var.set(
+                "Select a cluster to preview marker-driven suggestions."
+            )
             if self.annotation_tree is not None:
                 self.annotation_tree.delete(*self.annotation_tree.get_children())
                 self.annotation_tree["columns"] = ("cluster",)
@@ -3522,6 +3600,7 @@ class FlowDataApp:
             return
 
         dataset = self.clustering_results[run_key]
+        self.cluster_marker_profiles[run_key] = self._compute_cluster_marker_profiles(dataset)
         clusters = sorted(dataset["cluster"].astype(str).unique(), key=str)
         existing = self.cluster_annotations.get(run_key)
         if existing is None:
@@ -3549,11 +3628,14 @@ class FlowDataApp:
         self.cluster_annotation_status_var.set("")
         self._populate_annotation_tree(df)
         self._refresh_cluster_comparison_controls()
+        self._update_annotation_suggestion_preview()
 
     def _populate_annotation_tree(self, dataframe: pd.DataFrame) -> None:
         if self.annotation_tree is None:
             return
         columns = list(dataframe.columns)
+        selected_items = set(self.annotation_tree.selection())
+        focus_item = self.annotation_tree.focus()
         self.annotation_tree.delete(*self.annotation_tree.get_children())
         self.annotation_tree["columns"] = columns
         for column in columns:
@@ -3567,18 +3649,22 @@ class FlowDataApp:
             cluster_id = str(row["cluster"])
             values = [str(row.get(column, "")) for column in columns]
             self.annotation_tree.insert("", "end", iid=cluster_id, values=values)
+            if cluster_id in selected_items:
+                self.annotation_tree.selection_add(cluster_id)
+            if focus_item == cluster_id:
+                self.annotation_tree.focus(cluster_id)
 
         run_key = self.current_annotation_run_key
         if run_key:
             suggestions = self.cluster_annotation_recent_terms.setdefault(run_key, set())
             for column in columns[1:]:
-                suggestions.update(
-                    {
-                        str(value)
-                        for value in dataframe[column].dropna().unique()
-                        if str(value).strip()
-                    }
-                )
+                values = {
+                    self.annotation_ontology.canonicalize(column, str(value))
+                    for value in dataframe[column].dropna().unique()
+                    if str(value).strip()
+                }
+                suggestions.update({value for value in values if value})
+        self._update_annotation_suggestion_preview()
 
     def _add_annotation_column(self) -> None:
         run_key = self.current_annotation_run_key
@@ -3608,6 +3694,29 @@ class FlowDataApp:
         self._populate_annotation_tree(df)
         self.cluster_annotation_status_var.set(f"Added column '{column_name}'.")
         self._refresh_cluster_comparison_controls()
+
+    def _compute_cluster_marker_profiles(
+        self, dataset: pd.DataFrame
+    ) -> Dict[str, Dict[str, float]]:
+        marker_columns = [
+            column
+            for column in dataset.columns
+            if column != "cluster"
+            and column != "__source_file"
+            and is_numeric_dtype(dataset[column])
+        ]
+        if not marker_columns:
+            return {}
+        safe_dataset = dataset.copy()
+        safe_dataset["cluster"] = safe_dataset["cluster"].astype(str)
+        grouped = safe_dataset.groupby("cluster")[marker_columns].mean(numeric_only=True)
+        marker_profiles: Dict[str, Dict[str, float]] = {}
+        for cluster_id, row in grouped.iterrows():
+            marker_profiles[str(cluster_id)] = {
+                column: float(value) if pd.notna(value) else 0.0
+                for column, value in row.items()
+            }
+        return marker_profiles
 
     def _remove_annotation_column(self) -> None:
         run_key = self.current_annotation_run_key
@@ -3702,72 +3811,451 @@ class FlowDataApp:
         bbox = self.annotation_tree.bbox(item_id, column_name)
         if not bbox:
             return
-        x, y, width, height = bbox
-        value = self.annotation_tree.set(item_id, column_name)
-        run_key = self.current_annotation_run_key
-        suggestions = self._get_annotation_suggestions(run_key, column_name)
+        self._open_annotation_editor(item_id, column_name, bbox)
 
+    def _start_annotation_edit_from_shortcut(
+        self, _event: Optional[tk.Event] = None
+    ) -> None:
+        if self.annotation_tree is None:
+            return
+        selection = self.annotation_tree.selection()
+        if not selection:
+            return
+        columns = list(self.annotation_tree["columns"])
+        if len(columns) <= 1:
+            return
+        item_id = selection[0]
+        column_name = columns[1]
+        bbox = self.annotation_tree.bbox(item_id, column_name)
+        if not bbox:
+            return
+        self._open_annotation_editor(item_id, column_name, bbox)
+
+    def _open_annotation_editor(
+        self, item_id: str, column_name: str, bbox: tuple[int, int, int, int]
+    ) -> None:
+        if self.annotation_tree is None:
+            return
+        if self.annotation_edit_widget is not None:
+            self._cancel_annotation_edit()
+        run_key = self.current_annotation_run_key
+        suggestions = self._get_annotation_suggestions(run_key, column_name, item_id)
+        x, y, width, height = bbox
+        current_value = self.annotation_tree.set(item_id, column_name)
         combo = ttk.Combobox(
             self.annotation_tree,
-            values=sorted(suggestions, key=str.lower),
+            values=suggestions,
             width=max(12, int(width / 8)),
         )
         combo.place(x=x, y=y, width=width, height=height)
-        combo.insert(0, value)
+        combo.insert(0, current_value)
         combo.focus_set()
         combo.bind("<Return>", lambda _e: self._commit_annotation_edit(combo))
         combo.bind("<FocusOut>", lambda _e: self._commit_annotation_edit(combo))
         combo.bind("<Escape>", lambda _e: self._cancel_annotation_edit())
+        combo.bind("<Control-space>", lambda _e: self._apply_first_suggestion(combo))
+        combo.bind("<Control-Down>", lambda _e: self._cycle_annotation_suggestion(combo, 1))
+        combo.bind("<Control-Up>", lambda _e: self._cycle_annotation_suggestion(combo, -1))
         self.annotation_edit_widget = combo
+        selection = self.annotation_tree.selection()
+        original_values = {
+            row_id: self.annotation_tree.set(row_id, column_name)
+            for row_id in (selection if selection else (item_id,))
+        }
         self.annotation_edit_info = {
             "item": item_id,
             "column": column_name,
             "run_key": run_key,
+            "suggestions": suggestions,
+            "apply_to_selection": len(selection) > 1,
+            "original_values": original_values,
         }
 
-    def _get_annotation_suggestions(self, run_key: Optional[str], column_name: str) -> Set[str]:
-        suggestions: Set[str] = set()
+    def _get_annotation_suggestions(
+        self,
+        run_key: Optional[str],
+        column_name: str,
+        cluster_id: Optional[str] = None,
+    ) -> List[str]:
+        ranked: List[Tuple[int, str]] = []
+        seen: Set[str] = set()
+
+        def add_suggestion(value: str, score: int) -> None:
+            canonical = self.annotation_ontology.canonicalize(column_name, value)
+            if not canonical:
+                return
+            if canonical not in seen:
+                ranked.append((score, canonical))
+                seen.add(canonical)
+
+        if run_key and cluster_id:
+            profile = self.cluster_marker_profiles.get(run_key, {}).get(str(cluster_id), {})
+            for value, score in self.annotation_ontology.suggest_for_cluster(
+                column_name, profile
+            ):
+                add_suggestion(value, 120 + score)
+
         if run_key and run_key in self.cluster_annotations:
             df = self.cluster_annotations[run_key]
             if column_name in df.columns:
-                suggestions.update(
-                    {
-                        str(value)
-                        for value in df[column_name].dropna().unique()
-                        if str(value).strip()
-                    }
-                )
+                for value in df[column_name].dropna().unique():
+                    add_suggestion(str(value), 80)
+
         if run_key:
-            suggestions.update(self.cluster_annotation_recent_terms.get(run_key, set()))
-        return {s for s in suggestions if s}
+            for value in self.cluster_annotation_recent_terms.get(run_key, set()):
+                add_suggestion(value, 90)
+
+        for value in self.annotation_ontology.allowed_values(column_name):
+            add_suggestion(value, 40)
+
+        ranked.sort(key=lambda item: (-item[0], item[1].lower()))
+        return [value for _, value in ranked]
 
     def _commit_annotation_edit(self, widget: ttk.Combobox) -> None:
         if self.annotation_edit_info is None:
             widget.destroy()
             self.annotation_edit_widget = None
             return
-        new_value = widget.get().strip()
         info = self.annotation_edit_info
-        item_id = info["item"]
-        column_name = info["column"]
-        run_key = info["run_key"]
+        new_value = widget.get().strip()
         widget.destroy()
         self.annotation_edit_widget = None
         self.annotation_edit_info = None
-        if not run_key or run_key not in self.cluster_annotations:
+
+        run_key = info.get("run_key")
+        column_name = info.get("column")
+        item_id = info.get("item")
+        if not run_key or run_key not in self.cluster_annotations or not column_name:
             return
+
         df = self.cluster_annotations[run_key]
-        mask = df["cluster"].astype(str) == str(item_id)
+        original_values: Dict[str, str] = info.get("original_values", {})
+        canonical_value = self.annotation_ontology.canonicalize(column_name, new_value)
+
+        if canonical_value and not self.annotation_ontology.is_value_allowed(
+            column_name, canonical_value
+        ):
+            allowed = self.annotation_ontology.allowed_values(column_name)
+            preview = ", ".join(allowed[:5]) if allowed else "(no ontology matches)"
+            proceed = messagebox.askyesno(
+                "Confirm custom annotation",
+                (
+                    f"'{canonical_value}' is not recognised by the ontology for '{column_name}'.\n"
+                    f"Allowed values include: {preview}.\n"
+                    "Use it anyway?"
+                ),
+            )
+            if not proceed:
+                self._restore_annotation_values(df, column_name, original_values)
+                self.cluster_annotation_status_var.set(
+                    "Annotation cancelled; value not stored."
+                )
+                return
+            self.annotation_ontology.register_custom_value(column_name, canonical_value)
+
+        apply_to_selection = info.get("apply_to_selection")
+        target_items = list(self.annotation_tree.selection()) if apply_to_selection else []
+        if not target_items:
+            target_items = [item_id]
+
         if column_name not in df.columns:
             df[column_name] = ""
-        df.loc[mask, column_name] = new_value
+
+        for target_item in target_items:
+            mask = df["cluster"].astype(str) == str(target_item)
+            df.loc[mask, column_name] = canonical_value
+            self.annotation_tree.set(target_item, column_name, canonical_value)
+
         self.cluster_annotations[run_key] = df
-        self.annotation_tree.set(item_id, column_name, new_value)
-        if new_value:
-            self.cluster_annotation_recent_terms.setdefault(run_key, set()).add(new_value)
-        self.cluster_annotation_status_var.set(
-            f"Updated cluster {item_id} → {column_name} = {new_value or '(blank)'}"
+        if canonical_value:
+            self.cluster_annotation_recent_terms.setdefault(run_key, set()).add(
+                canonical_value
+            )
+
+        if len(target_items) > 1:
+            status = (
+                f"Updated {len(target_items)} clusters → {column_name} = "
+                f"{canonical_value or '(blank)'}"
+            )
+        else:
+            status = (
+                f"Updated cluster {target_items[0]} → {column_name} = "
+                f"{canonical_value or '(blank)'}"
+            )
+        self.cluster_annotation_status_var.set(status)
+        self._update_annotation_suggestion_preview()
+
+    def _restore_annotation_values(
+        self,
+        dataframe: pd.DataFrame,
+        column_name: str,
+        original_values: Dict[str, str],
+    ) -> None:
+        for item_id, value in original_values.items():
+            mask = dataframe["cluster"].astype(str) == str(item_id)
+            if column_name not in dataframe.columns:
+                dataframe[column_name] = ""
+            dataframe.loc[mask, column_name] = value
+            self.annotation_tree.set(item_id, column_name, value)
+        if self.current_annotation_run_key:
+            self.cluster_annotations[self.current_annotation_run_key] = dataframe
+
+    def _apply_first_suggestion(self, widget: ttk.Combobox) -> None:
+        info = self.annotation_edit_info
+        if not info:
+            return
+        suggestions = info.get("suggestions", [])
+        if suggestions:
+            widget.set(suggestions[0])
+            widget.selection_range(0, tk.END)
+
+    def _cycle_annotation_suggestion(
+        self, widget: ttk.Combobox, direction: int
+    ) -> None:
+        info = self.annotation_edit_info
+        if not info:
+            return
+        suggestions = info.get("suggestions", [])
+        if not suggestions:
+            return
+        current = widget.get().strip()
+        try:
+            index = suggestions.index(current)
+        except ValueError:
+            index = -direction
+        new_index = (index + direction) % len(suggestions)
+        widget.set(suggestions[new_index])
+        widget.selection_range(0, tk.END)
+
+    def _update_annotation_suggestion_preview(self) -> None:
+        run_key = self.current_annotation_run_key
+        if (
+            not run_key
+            or run_key not in self.cluster_annotations
+            or self.annotation_tree is None
+        ):
+            self.annotation_suggestion_var.set(
+                "Select a cluster to preview marker-driven suggestions."
+            )
+            return
+
+        selection = self.annotation_tree.selection()
+        if not selection:
+            self.annotation_suggestion_var.set(
+                "Select a cluster to preview marker-driven suggestions."
+            )
+            return
+
+        editable_columns = [col for col in self.current_annotation_columns if col != "cluster"]
+        if not editable_columns:
+            self.annotation_suggestion_var.set(
+                "Add an annotation column to unlock ontology suggestions."
+            )
+            return
+
+        target_column = editable_columns[0]
+        cluster_id = selection[0]
+        suggestions = self._get_annotation_suggestions(run_key, target_column, cluster_id)
+        marker_profile = self.cluster_marker_profiles.get(run_key, {}).get(
+            str(cluster_id),
+            {},
         )
+        marker_text = ""
+        if marker_profile:
+            top_markers = sorted(
+                marker_profile.items(), key=lambda item: item[1], reverse=True
+            )[:4]
+            if top_markers:
+                marker_text = ", ".join(
+                    f"{marker} ({value:.2f})" for marker, value in top_markers
+                )
+
+        if suggestions:
+            suggestion_text = ", ".join(suggestions[:5])
+            message = f"Suggested {target_column}: {suggestion_text}"
+            if marker_text:
+                message = f"Top markers: {marker_text}\n{message}"
+        else:
+            message = "No ontology suggestions available for the selected cluster."
+            if marker_text:
+                message = f"Top markers: {marker_text}\n{message}"
+        self.annotation_suggestion_var.set(message)
+
+    def _refresh_annotation_recipe_choices(self) -> None:
+        if not hasattr(self, "annotation_recipe_combo"):
+            return
+        recipes = self.annotation_ontology.list_recipes()
+        current = self.annotation_recipe_var.get()
+        self.annotation_recipe_combo["values"] = recipes
+        if current not in recipes:
+            if recipes:
+                self.annotation_recipe_var.set(recipes[0])
+            else:
+                self.annotation_recipe_var.set("")
+        self._update_annotation_recipe_description()
+
+    def _update_annotation_recipe_description(self) -> None:
+        recipe_name = self.annotation_recipe_var.get()
+        recipe = self.annotation_ontology.get_recipe(recipe_name) if recipe_name else None
+        if not recipe:
+            self.annotation_recipe_description_var.set(
+                "Select a recipe to preview its annotation values."
+            )
+            return
+        description = recipe.get("description", "") or ""
+        values = recipe.get("values", {}) or {}
+        mapping = ", ".join(f"{column} → {value}" for column, value in values.items())
+        if description and mapping:
+            text = f"{description}\nApplies: {mapping}"
+        elif mapping:
+            text = f"Applies: {mapping}"
+        else:
+            text = description or "Recipe has no annotation values configured."
+        self.annotation_recipe_description_var.set(text)
+
+    def _apply_selected_annotation_recipe(self) -> None:
+        run_key = self.current_annotation_run_key
+        if not run_key or run_key not in self.cluster_annotations:
+            messagebox.showinfo(
+                "Select run", "Select a clustering run before applying a recipe."
+            )
+            return
+        recipe_name = self.annotation_recipe_var.get()
+        if not recipe_name:
+            messagebox.showinfo("Select recipe", "Choose a recipe to apply.")
+            return
+        recipe = self.annotation_ontology.get_recipe(recipe_name)
+        if not recipe:
+            messagebox.showerror(
+                "Recipe missing", f"The recipe '{recipe_name}' could not be loaded."
+            )
+            return
+        if self.annotation_tree is None:
+            return
+        selection = self.annotation_tree.selection()
+        if not selection:
+            messagebox.showinfo(
+                "Select clusters", "Select one or more clusters before applying a recipe."
+            )
+            return
+        df = self.cluster_annotations[run_key]
+        selection_ids = [str(item) for item in selection]
+        needs_refresh = False
+        for column, value in (recipe.get("values") or {}).items():
+            display_column, added = self._ensure_annotation_column(run_key, column)
+            needs_refresh = needs_refresh or added
+            canonical_value = self.annotation_ontology.canonicalize(column, str(value))
+            mask = df["cluster"].astype(str).isin(selection_ids)
+            if display_column not in df.columns:
+                df[display_column] = ""
+            df.loc[mask, display_column] = canonical_value
+            for item in selection_ids:
+                self.annotation_tree.set(item, display_column, canonical_value)
+            if canonical_value:
+                self.cluster_annotation_recent_terms.setdefault(run_key, set()).add(
+                    canonical_value
+                )
+        self.cluster_annotations[run_key] = df
+        if needs_refresh:
+            self._populate_annotation_tree(df)
+            for item in selection_ids:
+                self.annotation_tree.selection_add(item)
+        self.cluster_annotation_status_var.set(
+            f"Applied recipe '{recipe_name}' to {len(selection_ids)} clusters."
+        )
+        self._update_annotation_suggestion_preview()
+
+    def _save_selection_as_recipe(self) -> None:
+        run_key = self.current_annotation_run_key
+        if not run_key or run_key not in self.cluster_annotations:
+            messagebox.showinfo(
+                "Select run", "Select a clustering run before saving a recipe."
+            )
+            return
+        if self.annotation_tree is None:
+            return
+        selection = self.annotation_tree.selection()
+        if not selection:
+            messagebox.showinfo(
+                "Select clusters", "Select at least one cluster to capture a recipe."
+            )
+            return
+        editable_columns = [col for col in self.current_annotation_columns if col != "cluster"]
+        if not editable_columns:
+            messagebox.showinfo(
+                "No annotations", "Add annotation columns before creating a recipe."
+            )
+            return
+        df = self.cluster_annotations[run_key]
+        source_id = selection[0]
+        row = df[df["cluster"].astype(str) == str(source_id)]
+        if row.empty:
+            messagebox.showerror(
+                "No data", "The selected cluster has no annotation values yet."
+            )
+            return
+        values: Dict[str, str] = {}
+        series = row.iloc[0]
+        for column in editable_columns:
+            raw_value = str(series.get(column, "")).strip()
+            if raw_value:
+                values[column] = self.annotation_ontology.canonicalize(column, raw_value)
+        if not values:
+            messagebox.showinfo(
+                "No values", "The selected cluster has no annotation values to store."
+            )
+            return
+        name = simpledialog.askstring(
+            "Save annotation recipe",
+            "Enter a name for the recipe:",
+            parent=self.root,
+        )
+        if not name:
+            return
+        description = (
+            simpledialog.askstring(
+                "Recipe description", "Optional description:", parent=self.root
+            )
+            or ""
+        )
+        self.annotation_ontology.add_recipe(name, description, values)
+        self._refresh_annotation_recipe_choices()
+        self.annotation_recipe_var.set(name)
+        self._update_annotation_recipe_description()
+        self.cluster_annotation_status_var.set(
+            f"Saved recipe '{name}' with {len(values)} fields."
+        )
+
+    def _ensure_annotation_column(
+        self, run_key: str, column_name: str
+    ) -> Tuple[str, bool]:
+        df = self.cluster_annotations[run_key]
+        target_key = (
+            self.annotation_ontology.normalize_column(column_name)
+            or column_name.strip().lower()
+        )
+        for existing in df.columns:
+            if existing == "cluster":
+                continue
+            existing_key = (
+                self.annotation_ontology.normalize_column(existing)
+                or existing.strip().lower()
+            )
+            if existing_key == target_key:
+                return existing, False
+
+        display_name = column_name
+        if display_name in df.columns:
+            return display_name, False
+        pretty = column_name.replace("_", " ").title()
+        if pretty in df.columns:
+            return pretty, False
+        display_name = pretty if pretty not in df.columns else column_name
+        df[display_name] = ""
+        self.cluster_annotations[run_key] = df
+        if display_name not in self.current_annotation_columns:
+            self.current_annotation_columns.append(display_name)
+        return display_name, True
 
     def _refresh_cluster_comparison_controls(self) -> None:
         if not hasattr(self, "cluster_compare_method_combo"):
