@@ -1,4 +1,5 @@
 import copy
+import os
 import re
 import sys
 import tkinter as tk
@@ -10,10 +11,10 @@ import random
 import uuid
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from functools import partial
-from threading import Thread
+from threading import Event, Lock, Thread
 from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
@@ -100,6 +101,11 @@ except ImportError:
     nn = None  # type: ignore[assignment]
     TensorDataset = None  # type: ignore[assignment]
 
+try:
+    import psutil  # type: ignore[import]
+except ImportError:
+    psutil = None  # type: ignore[assignment]
+
 
 RANDOM_STATE = 42
 MAX_UNIQUE_CATEGORY_SAMPLE = 200
@@ -109,6 +115,225 @@ CSV_METADATA_SAMPLE_ROWS = 5000
 DEFAULT_CSV_CHUNKSIZE = 200_000
 IS_DARWIN = sys.platform == "darwin"
 
+
+class BackgroundJobCancelled(RuntimeError):
+    """Raised when a background job is cancelled."""
+
+
+@dataclass
+class BackgroundJob:
+    job_id: str
+    name: str
+    total_units: int
+    metadata: Dict[str, object]
+    completed_units: int = 0
+    status: str = "running"
+    message: str = ""
+    start_time: float = field(default_factory=time.time)
+    last_update: float = field(default_factory=time.time)
+    pause_event: Event = field(default_factory=Event)
+    cancel_event: Event = field(default_factory=Event)
+
+    def __post_init__(self) -> None:
+        self.total_units = max(1, int(self.total_units))
+        self.pause_event.clear()
+        self.cancel_event.clear()
+        now = time.time()
+        self.start_time = now
+        self.last_update = now
+
+    @property
+    def progress(self) -> float:
+        if self.total_units <= 0:
+            return 0.0
+        return min(1.0, max(0.0, self.completed_units / self.total_units))
+
+    @property
+    def elapsed(self) -> float:
+        return max(0.0, time.time() - self.start_time)
+
+    @property
+    def eta_seconds(self) -> Optional[float]:
+        if self.completed_units <= 0:
+            return None
+        elapsed = max(0.01, time.time() - self.start_time)
+        rate = self.completed_units / elapsed
+        if rate <= 0:
+            return None
+        remaining = max(0.0, self.total_units - self.completed_units)
+        return remaining / rate
+
+
+class BackgroundJobManager:
+    """Tracks and controls background job execution."""
+
+    def __init__(self) -> None:
+        self._jobs: Dict[str, BackgroundJob] = {}
+        self._lock = Lock()
+
+    def start_job(
+        self,
+        name: str,
+        total_units: int,
+        metadata: Optional[Dict[str, object]] = None,
+    ) -> str:
+        job_id = uuid.uuid4().hex
+        job = BackgroundJob(
+            job_id=job_id,
+            name=name,
+            total_units=total_units,
+            metadata=metadata or {},
+        )
+        with self._lock:
+            self._jobs[job_id] = job
+        return job_id
+
+    def get_job(self, job_id: Optional[str]) -> Optional[BackgroundJob]:
+        if not job_id:
+            return None
+        with self._lock:
+            return copy.deepcopy(self._jobs.get(job_id))
+
+    def request_pause(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.pause_event.set()
+            job.status = "paused"
+            job.message = job.message or "Paused"
+            job.last_update = time.time()
+
+    def request_resume(self, job_id: str) -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.pause_event.clear()
+            if job.status in {"paused", "cancelling"} and not job.cancel_event.is_set():
+                job.status = "running"
+            elif job.status == "paused":
+                job.status = "running"
+            job.last_update = time.time()
+
+    def request_cancel(self, job_id: str, message: str = "Cancelled by user") -> None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.cancel_event.set()
+            job.status = "cancelling"
+            job.message = message
+            job.last_update = time.time()
+
+    def wait_if_paused(self, job_id: Optional[str], poll_interval: float = 0.1) -> None:
+        if not job_id:
+            return
+        while True:
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if not job:
+                    return
+                if job.cancel_event.is_set():
+                    raise BackgroundJobCancelled(job_id)
+                paused = job.pause_event.is_set()
+            if not paused:
+                return
+            time.sleep(poll_interval)
+
+    def raise_if_cancelled(self, job_id: Optional[str]) -> None:
+        if not job_id:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job and job.cancel_event.is_set():
+                raise BackgroundJobCancelled(job_id)
+
+    def increment_job(
+        self,
+        job_id: Optional[str],
+        amount: int = 1,
+        message: Optional[str] = None,
+    ) -> None:
+        if not job_id:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.completed_units = min(job.total_units, job.completed_units + amount)
+            job.last_update = time.time()
+            if message is not None:
+                job.message = message
+            if job.cancel_event.is_set():
+                job.status = "cancelling"
+            elif not job.pause_event.is_set():
+                job.status = "running"
+
+    def update_message(self, job_id: Optional[str], message: str) -> None:
+        if not job_id:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.message = message
+            job.last_update = time.time()
+
+    def mark_completed(self, job_id: Optional[str], message: str = "Completed") -> None:
+        if not job_id:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.completed_units = job.total_units
+            job.status = "completed"
+            job.message = message
+            job.last_update = time.time()
+
+    def mark_cancelled(self, job_id: Optional[str], message: str) -> None:
+        if not job_id:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.status = "cancelled"
+            job.message = message
+            job.last_update = time.time()
+
+    def mark_failed(self, job_id: Optional[str], message: str) -> None:
+        if not job_id:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return
+            job.status = "failed"
+            job.message = message
+            job.last_update = time.time()
+
+    def snapshot(self) -> List[Dict[str, object]]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        snapshots = []
+        for job in jobs:
+            snapshots.append(
+                {
+                    "job_id": job.job_id,
+                    "name": job.name,
+                    "status": job.status,
+                    "message": job.message,
+                    "completed_units": job.completed_units,
+                    "total_units": job.total_units,
+                    "progress": job.progress,
+                    "eta_seconds": job.eta_seconds,
+                    "elapsed": job.elapsed,
+                    "metadata": copy.deepcopy(job.metadata),
+                }
+            )
+        return snapshots
 
 class ScrollableFrame(ttk.Frame):
     def __init__(self, parent: tk.Widget) -> None:
@@ -403,6 +628,11 @@ class FlowDataApp:
         self.trained_model: Optional[object] = None
         self.training_results: Dict[str, object] = {}
         self.csv_chunksize = DEFAULT_CSV_CHUNKSIZE
+        self.job_manager = BackgroundJobManager()
+        self.active_training_job_id: Optional[str] = None
+        self.active_clustering_job_id: Optional[str] = None
+        self.monitor_refresh_job: Optional[str] = None
+        self.monitor_selected_job: Optional[str] = None
 
         self.training_model_var = tk.StringVar(value="Random Forest")
         self.n_estimators_var = tk.IntVar(value=300)
@@ -500,6 +730,18 @@ class FlowDataApp:
                 "description": "Feed-forward neural network (PyTorch) with configurable hidden layers and optional GPU acceleration.",
             },
         }
+
+        self.monitor_cpu_var = tk.StringVar(value="CPU: -- %")
+        self.monitor_memory_var = tk.StringVar(value="Memory: -- %")
+        self.monitor_swap_var = tk.StringVar(value="Swap: -- %")
+        self.monitor_job_status_var = tk.StringVar(value="No background jobs running.")
+        self.monitor_training_worker_var = tk.StringVar(value="Training worker: idle")
+        self.monitor_clustering_worker_var = tk.StringVar(value="Clustering worker: idle")
+        self.monitor_jobs_tree: Optional[ttk.Treeview] = None
+        self.monitor_queue_tree: Optional[ttk.Treeview] = None
+        self.monitor_pause_button: Optional[ttk.Button] = None
+        self.monitor_resume_button: Optional[ttk.Button] = None
+        self.monitor_cancel_button: Optional[ttk.Button] = None
 
         # Clustering module state
         self.clustering_methods = {
@@ -843,6 +1085,10 @@ class FlowDataApp:
         self._init_clustering_explorer_tab(clustering_notebook)
         self._init_clustering_annotation_tab(clustering_notebook)
         self._init_clustering_comparison_tab(clustering_notebook)
+
+        monitor_tab = ttk.Frame(notebook)
+        notebook.add(monitor_tab, text="System Monitor")
+        self._init_system_monitor_tab(monitor_tab)
 
     def _init_files_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
@@ -4392,6 +4638,418 @@ class FlowDataApp:
             command=self._restore_selected_run,
         ).pack(side="left")
 
+    def _init_system_monitor_tab(self, container: ttk.Frame) -> None:
+        monitor_frame = ttk.Frame(container, padding=12)
+        monitor_frame.pack(fill="both", expand=True)
+
+        resources_frame = ttk.LabelFrame(monitor_frame, text="Resource usage", padding=8)
+        resources_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(resources_frame, textvariable=self.monitor_cpu_var).pack(
+            anchor="w", pady=(0, 2)
+        )
+        ttk.Label(resources_frame, textvariable=self.monitor_memory_var).pack(
+            anchor="w", pady=(0, 2)
+        )
+        ttk.Label(resources_frame, textvariable=self.monitor_swap_var).pack(
+            anchor="w"
+        )
+
+        workers_frame = ttk.LabelFrame(monitor_frame, text="Workers", padding=8)
+        workers_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(workers_frame, textvariable=self.monitor_training_worker_var).pack(
+            anchor="w", pady=(0, 2)
+        )
+        ttk.Label(workers_frame, textvariable=self.monitor_clustering_worker_var).pack(
+            anchor="w"
+        )
+
+        queue_frame = ttk.LabelFrame(monitor_frame, text="Queues", padding=8)
+        queue_frame.pack(fill="x", pady=(0, 12))
+        queue_columns = ("queue", "pending", "notes")
+        queue_tree = ttk.Treeview(
+            queue_frame,
+            columns=queue_columns,
+            show="headings",
+            height=4,
+            selectmode="none",
+        )
+        for column, heading in zip(queue_columns, ["Queue", "Pending", "Details"]):
+            queue_tree.heading(column, text=heading)
+            anchor = "w" if column != "pending" else "center"
+            width = 220 if column == "notes" else 140
+            queue_tree.column(column, width=width, anchor=anchor)
+        queue_tree.pack(fill="x", expand=False)
+        self.monitor_queue_tree = queue_tree
+
+        jobs_frame = ttk.LabelFrame(monitor_frame, text="Background jobs", padding=8)
+        jobs_frame.pack(fill="both", expand=True)
+        ttk.Label(jobs_frame, textvariable=self.monitor_job_status_var).pack(
+            anchor="w", pady=(0, 6)
+        )
+        job_columns = ("name", "status", "progress", "eta", "message")
+        jobs_tree = ttk.Treeview(
+            jobs_frame,
+            columns=job_columns,
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        jobs_tree.heading("name", text="Job")
+        jobs_tree.heading("status", text="Status")
+        jobs_tree.heading("progress", text="Progress")
+        jobs_tree.heading("eta", text="ETA")
+        jobs_tree.heading("message", text="Message")
+        jobs_tree.column("name", width=180, anchor="w")
+        jobs_tree.column("status", width=120, anchor="center")
+        jobs_tree.column("progress", width=100, anchor="center")
+        jobs_tree.column("eta", width=120, anchor="center")
+        jobs_tree.column("message", width=320, anchor="w")
+        jobs_tree.pack(fill="both", expand=True)
+        jobs_tree.bind("<<TreeviewSelect>>", lambda _e: self._on_monitor_job_select())
+        self.monitor_jobs_tree = jobs_tree
+
+        buttons_row = ttk.Frame(jobs_frame)
+        buttons_row.pack(fill="x", pady=(8, 0))
+        pause_button = ttk.Button(
+            buttons_row,
+            text="Pause",
+            command=self._pause_selected_job,
+            state="disabled",
+        )
+        pause_button.pack(side="left")
+        resume_button = ttk.Button(
+            buttons_row,
+            text="Resume",
+            command=self._resume_selected_job,
+            state="disabled",
+        )
+        resume_button.pack(side="left", padx=(8, 0))
+        cancel_button = ttk.Button(
+            buttons_row,
+            text="Cancel",
+            command=self._cancel_selected_job,
+            state="disabled",
+        )
+        cancel_button.pack(side="left", padx=(8, 0))
+        self.monitor_pause_button = pause_button
+        self.monitor_resume_button = resume_button
+        self.monitor_cancel_button = cancel_button
+
+        self._schedule_system_monitor_refresh(initial_delay=200)
+
+    def _schedule_system_monitor_refresh(
+        self, interval: int = 1500, initial_delay: Optional[int] = None
+    ) -> None:
+        delay = interval if initial_delay is None else initial_delay
+        if self.monitor_refresh_job is not None:
+            try:
+                self.root.after_cancel(self.monitor_refresh_job)
+            except Exception:
+                pass
+        self.monitor_refresh_job = self.root.after(
+            delay, lambda: self._refresh_system_monitor(interval)
+        )
+
+    def _refresh_system_monitor(self, interval: int = 1500) -> None:
+        self.monitor_refresh_job = None
+        snapshot = self._collect_system_metrics()
+        self._apply_system_snapshot(snapshot)
+        self.monitor_refresh_job = self.root.after(
+            interval, lambda: self._refresh_system_monitor(interval)
+        )
+
+    def _collect_system_metrics(self) -> Dict[str, object]:
+        cpu_percent: Optional[float]
+        memory_percent: Optional[float] = None
+        swap_percent: Optional[float] = None
+        memory_used: Optional[int] = None
+        memory_total: Optional[int] = None
+        swap_used: Optional[int] = None
+        swap_total: Optional[int] = None
+        if psutil is not None:
+            try:
+                cpu_percent = float(psutil.cpu_percent(interval=None))
+            except Exception:
+                cpu_percent = None
+            try:
+                vm = psutil.virtual_memory()
+                memory_percent = float(vm.percent)
+                memory_used = int(vm.used)
+                memory_total = int(vm.total)
+            except Exception:
+                pass
+            try:
+                sm = psutil.swap_memory()
+                swap_percent = float(sm.percent)
+                swap_used = int(sm.used)
+                swap_total = int(sm.total)
+            except Exception:
+                pass
+        else:
+            try:
+                load_avg = os.getloadavg()[0]
+                cpu_count = max(1, multiprocessing.cpu_count())
+                cpu_percent = min(100.0, max(0.0, (load_avg / cpu_count) * 100.0))
+            except Exception:
+                cpu_percent = None
+
+        queues: List[Dict[str, object]] = []
+        try:
+            training_pending = self.training_queue.qsize()
+        except Exception:
+            training_pending = "n/a"
+        queues.append(
+            {
+                "queue": "Training results",
+                "pending": training_pending,
+                "notes": "Messages waiting from training worker",
+            }
+        )
+        try:
+            clustering_pending = self.clustering_queue.qsize() if hasattr(self, "clustering_queue") else 0
+        except Exception:
+            clustering_pending = "n/a"
+        queues.append(
+            {
+                "queue": "Clustering results",
+                "pending": clustering_pending,
+                "notes": "Messages waiting from clustering worker",
+            }
+        )
+
+        training_thread_alive = bool(self.training_thread and self.training_thread.is_alive())
+        clustering_thread_alive = bool(
+            getattr(self, "clustering_thread", None)
+            and getattr(self, "clustering_thread").is_alive()
+        )
+        worker_states = {
+            "training": {
+                "status": "running" if self.training_in_progress else "idle",
+                "alive": training_thread_alive,
+                "job_id": self.active_training_job_id,
+            },
+            "clustering": {
+                "status": "running"
+                if getattr(self, "clustering_in_progress", False)
+                else "idle",
+                "alive": clustering_thread_alive,
+                "job_id": self.active_clustering_job_id,
+            },
+        }
+
+        return {
+            "cpu_percent": cpu_percent,
+            "memory_percent": memory_percent,
+            "memory_used": memory_used,
+            "memory_total": memory_total,
+            "swap_percent": swap_percent,
+            "swap_used": swap_used,
+            "swap_total": swap_total,
+            "queues": queues,
+            "workers": worker_states,
+            "jobs": self.job_manager.snapshot(),
+        }
+
+    def _apply_system_snapshot(self, snapshot: Dict[str, object]) -> None:
+        cpu_percent = snapshot.get("cpu_percent")
+        if isinstance(cpu_percent, (int, float)):
+            self.monitor_cpu_var.set(f"CPU: {cpu_percent:.1f}%")
+        else:
+            self.monitor_cpu_var.set("CPU: unavailable")
+
+        mem_percent = snapshot.get("memory_percent")
+        mem_used = snapshot.get("memory_used")
+        mem_total = snapshot.get("memory_total")
+        if isinstance(mem_percent, (int, float)) and isinstance(mem_used, int) and isinstance(mem_total, int):
+            self.monitor_memory_var.set(
+                f"Memory: {mem_percent:.1f}% ({self._format_bytes(mem_used)} / {self._format_bytes(mem_total)})"
+            )
+        elif isinstance(mem_percent, (int, float)):
+            self.monitor_memory_var.set(f"Memory: {mem_percent:.1f}%")
+        else:
+            self.monitor_memory_var.set("Memory: unavailable")
+
+        swap_percent = snapshot.get("swap_percent")
+        swap_used = snapshot.get("swap_used")
+        swap_total = snapshot.get("swap_total")
+        if (
+            isinstance(swap_percent, (int, float))
+            and isinstance(swap_used, int)
+            and isinstance(swap_total, int)
+            and swap_total > 0
+        ):
+            self.monitor_swap_var.set(
+                f"Swap: {swap_percent:.1f}% ({self._format_bytes(swap_used)} / {self._format_bytes(swap_total)})"
+            )
+        elif isinstance(swap_percent, (int, float)):
+            self.monitor_swap_var.set(f"Swap: {swap_percent:.1f}%")
+        else:
+            self.monitor_swap_var.set("Swap: unavailable")
+
+        workers = snapshot.get("workers", {})
+        training_worker = workers.get("training", {}) if isinstance(workers, dict) else {}
+        clustering_worker = workers.get("clustering", {}) if isinstance(workers, dict) else {}
+        self.monitor_training_worker_var.set(
+            "Training worker: {}{}".format(
+                training_worker.get("status", "unknown"),
+                " (thread alive)" if training_worker.get("alive") else "",
+            )
+        )
+        self.monitor_clustering_worker_var.set(
+            "Clustering worker: {}{}".format(
+                clustering_worker.get("status", "unknown"),
+                " (thread alive)" if clustering_worker.get("alive") else "",
+            )
+        )
+
+        queues = snapshot.get("queues", [])
+        if self.monitor_queue_tree is not None:
+            self.monitor_queue_tree.delete(*self.monitor_queue_tree.get_children())
+            if isinstance(queues, list):
+                for queue_info in queues:
+                    if not isinstance(queue_info, dict):
+                        continue
+                    self.monitor_queue_tree.insert(
+                        "",
+                        "end",
+                        values=(
+                            queue_info.get("queue", "-"),
+                            queue_info.get("pending", "-"),
+                            queue_info.get("notes", ""),
+                        ),
+                    )
+
+        jobs = snapshot.get("jobs", [])
+        active_jobs = []
+        if self.monitor_jobs_tree is not None:
+            current_selection = self.monitor_jobs_tree.selection()
+            selected_id = current_selection[0] if current_selection else self.monitor_selected_job
+            self.monitor_jobs_tree.delete(*self.monitor_jobs_tree.get_children())
+            if isinstance(jobs, list):
+                for job in jobs:
+                    if not isinstance(job, dict):
+                        continue
+                    job_id = job.get("job_id")
+                    progress = job.get("progress")
+                    eta_seconds = job.get("eta_seconds")
+                    status = job.get("status")
+                    if status in {"running", "paused", "cancelling"}:
+                        active_jobs.append(job)
+                    self.monitor_jobs_tree.insert(
+                        "",
+                        "end",
+                        iid=job_id,
+                        values=(
+                            job.get("name", "-"),
+                            status or "-",
+                            self._format_progress(progress),
+                            self._format_eta(eta_seconds),
+                            job.get("message", ""),
+                        ),
+                    )
+            if selected_id and selected_id in self.monitor_jobs_tree.get_children():
+                self.monitor_jobs_tree.selection_set(selected_id)
+                self.monitor_selected_job = selected_id
+            else:
+                self.monitor_selected_job = None
+
+        if active_jobs:
+            self.monitor_job_status_var.set(
+                "Active jobs: "
+                + ", ".join(
+                    str(job.get("name") or job.get("job_id") or "job")
+                    for job in active_jobs
+                )
+            )
+        elif jobs:
+            self.monitor_job_status_var.set("No active jobs. Completed jobs listed below.")
+        else:
+            self.monitor_job_status_var.set("No background jobs recorded yet.")
+
+        self._update_monitor_buttons()
+
+    def _update_monitor_buttons(self) -> None:
+        job_id = self.monitor_selected_job
+        job = self.job_manager.get_job(job_id)
+        pause_state = "disabled"
+        resume_state = "disabled"
+        cancel_state = "disabled"
+        if job is not None:
+            if job.status in {"running"}:
+                pause_state = "normal"
+                cancel_state = "normal"
+            elif job.status == "paused":
+                resume_state = "normal"
+                cancel_state = "normal"
+            elif job.status == "cancelling":
+                cancel_state = "normal"
+        for widget, state in (
+            (self.monitor_pause_button, pause_state),
+            (self.monitor_resume_button, resume_state),
+            (self.monitor_cancel_button, cancel_state),
+        ):
+            if widget is not None:
+                widget.configure(state=state)
+
+    def _on_monitor_job_select(self) -> None:
+        if not self.monitor_jobs_tree:
+            return
+        selection = self.monitor_jobs_tree.selection()
+        self.monitor_selected_job = selection[0] if selection else None
+        self._update_monitor_buttons()
+
+    def _pause_selected_job(self) -> None:
+        if not self.monitor_selected_job:
+            return
+        self.job_manager.request_pause(self.monitor_selected_job)
+        self._update_monitor_buttons()
+        self._schedule_system_monitor_refresh(initial_delay=0)
+
+    def _resume_selected_job(self) -> None:
+        if not self.monitor_selected_job:
+            return
+        self.job_manager.request_resume(self.monitor_selected_job)
+        self._update_monitor_buttons()
+        self._schedule_system_monitor_refresh(initial_delay=0)
+
+    def _cancel_selected_job(self) -> None:
+        if not self.monitor_selected_job:
+            return
+        self.job_manager.request_cancel(self.monitor_selected_job)
+        self._update_monitor_buttons()
+        self._schedule_system_monitor_refresh(initial_delay=0)
+
+    @staticmethod
+    def _format_progress(progress: Optional[float]) -> str:
+        if not isinstance(progress, (int, float)):
+            return "-"
+        return f"{max(0.0, min(1.0, progress)) * 100:.1f}%"
+
+    @staticmethod
+    def _format_eta(eta_seconds: Optional[float]) -> str:
+        if not isinstance(eta_seconds, (int, float)) or eta_seconds < 0:
+            return "-"
+        seconds = int(eta_seconds)
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}h {minutes:02d}m"
+        if minutes:
+            return f"{minutes:d}m {seconds:02d}s"
+        return f"{seconds:d}s"
+
+    @staticmethod
+    def _format_bytes(value: Optional[int]) -> str:
+        if not isinstance(value, int) or value < 0:
+            return "-"
+        units = ["B", "KB", "MB", "GB", "TB", "PB"]
+        size = float(value)
+        for unit in units:
+            if size < 1024.0 or unit == units[-1]:
+                return f"{size:.1f}{unit}"
+            size /= 1024.0
+        return f"{size:.1f}PB"
+
     def _load_run_registry(self) -> None:
         try:
             if self.run_registry_path.exists():
@@ -5886,8 +6544,12 @@ class FlowDataApp:
         ],
         n_jobs: int,
         base_metadata: Dict[str, object],
+        job_id: Optional[str],
     ) -> None:
+        manager = self.job_manager
         try:
+            manager.wait_if_paused(job_id)
+            manager.raise_if_cancelled(job_id)
             base_metadata = dict(base_metadata)
             results_summary: List[Dict[str, object]] = []
             cluster_breakdown: List[Dict[str, object]] = []
@@ -5897,11 +6559,14 @@ class FlowDataApp:
             label_map: Dict[str, str] = {}
 
             max_workers = max(1, min(len(selected_methods), n_jobs))
+            manager.increment_job(job_id, message="Workers ready")
 
             def run_single(method_tuple):
                 run_key, method_key, method_info, params, run_label = method_tuple
                 label = run_label
                 start_time = time.time()
+                manager.wait_if_paused(job_id)
+                manager.raise_if_cancelled(job_id)
                 labels = self._run_clustering_method(
                     method_key, features_scaled, params, n_jobs
                 )
@@ -5977,6 +6642,10 @@ class FlowDataApp:
                         metadata_entry.update(meta_entry)
                         metadata[run_key] = self._to_serializable(metadata_entry)
                         label_map[run_key] = run_label
+                        manager.raise_if_cancelled(job_id)
+                        manager.increment_job(
+                            job_id, message=f"Completed {run_label}"
+                        )
                     except ImportError as exc:
                         errors.append(f"{label}: missing dependency ({exc}).")
                         params_serializable = self._to_serializable(params)
@@ -5991,6 +6660,11 @@ class FlowDataApp:
                             }
                         )
                         metadata[run_key] = self._to_serializable(metadata_entry)
+                        manager.increment_job(
+                            job_id, message=f"{label} failed (dependency)"
+                        )
+                    except BackgroundJobCancelled:
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         errors.append(f"{label}: {exc}")
                         params_serializable = self._to_serializable(params)
@@ -6005,7 +6679,11 @@ class FlowDataApp:
                             }
                         )
                         metadata[run_key] = self._to_serializable(metadata_entry)
+                        manager.increment_job(
+                            job_id, message=f"{label} failed"
+                        )
 
+            manager.raise_if_cancelled(job_id)
             payload = {
                 "summary": results_summary,
                 "clusters": cluster_breakdown,
@@ -6017,8 +6695,18 @@ class FlowDataApp:
                 "labels": label_map,
             }
             self.clustering_queue.put({"status": "success", "payload": payload})
+            manager.mark_completed(job_id, "Clustering completed")
         except Exception as exc:  # noqa: BLE001
-            self.clustering_queue.put({"status": "error", "message": str(exc)})
+            if isinstance(exc, BackgroundJobCancelled):
+                self.clustering_queue.put(
+                    {"status": "cancelled", "message": "Clustering cancelled."}
+                )
+                manager.mark_cancelled(job_id, "Clustering cancelled")
+            else:
+                self.clustering_queue.put(
+                    {"status": "error", "message": str(exc)}
+                )
+                manager.mark_failed(job_id, f"Clustering failed: {exc}")
 
     def _run_clustering_method(
         self,
@@ -6142,8 +6830,11 @@ class FlowDataApp:
             self.root.after(200, self._check_clustering_queue)
             return
 
-        if message["status"] == "success":
+        status = message.get("status")
+        if status == "success":
             self._handle_clustering_success(message["payload"])
+        elif status == "cancelled":
+            self._handle_clustering_cancelled(message.get("message", "Clustering cancelled."))
         else:
             self._handle_clustering_failure(message["message"])
 
@@ -6151,6 +6842,7 @@ class FlowDataApp:
         self.clustering_in_progress = False
         self.clustering_progress.stop()
         self.run_clustering_button.configure(state="normal")
+        self.active_clustering_job_id = None
 
         errors: List[str] = payload.get("errors", [])  # type: ignore[assignment]
         summary: List[Dict[str, object]] = payload.get("summary", [])  # type: ignore[assignment]
@@ -6235,8 +6927,19 @@ class FlowDataApp:
         self.clustering_in_progress = False
         self.clustering_progress.stop()
         self.run_clustering_button.configure(state="normal")
+        self.active_clustering_job_id = None
         self.clustering_status_var.set(f"Clustering failed: {message}")
         messagebox.showerror("Clustering error", message)
+        self.pending_clustering_labels = {}
+        if hasattr(self, "clustering_umap_method_combo"):
+            self._update_clustering_visual_controls()
+
+    def _handle_clustering_cancelled(self, message: str) -> None:
+        self.clustering_in_progress = False
+        self.clustering_progress.stop()
+        self.run_clustering_button.configure(state="normal")
+        self.clustering_status_var.set(message or "Clustering cancelled.")
+        self.active_clustering_job_id = None
         self.pending_clustering_labels = {}
         if hasattr(self, "clustering_umap_method_combo"):
             self._update_clustering_visual_controls()
@@ -7051,6 +7754,20 @@ class FlowDataApp:
         }
         self.clustering_run_metadata_base = base_metadata.copy()
 
+        job_total_units = max(1, len(selected_methods) + 1)
+        self.active_clustering_job_id = self.job_manager.start_job(
+            "Clustering",
+            total_units=job_total_units,
+            metadata={
+                "methods": [label for label in pending_labels.values()],
+                "n_jobs": int(self.clustering_n_jobs_var.get()),
+                "rows": len(dataset),
+            },
+        )
+        self.job_manager.update_message(
+            self.active_clustering_job_id, "Preparing clustering workers"
+        )
+
         self.clustering_queue = queue.Queue()
         self.clustering_in_progress = True
         self.run_clustering_button.configure(state="disabled")
@@ -7068,6 +7785,7 @@ class FlowDataApp:
                 selected_methods,
                 clustering_jobs,
                 base_metadata,
+                self.active_clustering_job_id,
             ),
             daemon=True,
         )
@@ -7206,6 +7924,20 @@ class FlowDataApp:
             "target": target_column,
         }
 
+        self.active_training_job_id = self.job_manager.start_job(
+            "Model training",
+            total_units=5,
+            metadata={
+                "model": model_name,
+                "target": target_column,
+                "cv_folds": cv_folds,
+                "n_jobs": n_jobs,
+            },
+        )
+        self.job_manager.update_message(
+            self.active_training_job_id, "Preparing training data"
+        )
+
         self.training_results = {}
         self.training_queue = queue.Queue()
         self.training_in_progress = True
@@ -7224,13 +7956,15 @@ class FlowDataApp:
 
         self.training_thread = Thread(
             target=self._train_model_worker,
-            args=(config, dataset),
+            args=(config, dataset, self.active_training_job_id),
             daemon=True,
         )
         self.training_thread.start()
         self.root.after(150, self._check_training_queue)
 
-    def _train_model_worker(self, config: Dict[str, object], dataset: pd.DataFrame) -> None:
+    def _train_model_worker(
+        self, config: Dict[str, object], dataset: pd.DataFrame, job_id: Optional[str]
+    ) -> None:
         try:
             start_time = time.time()
             model_name = config["model_name"]
@@ -7240,6 +7974,11 @@ class FlowDataApp:
             test_size = float(config["test_size"])  # type: ignore[arg-type]
             cv_folds = int(config["cv_folds"])  # type: ignore[arg-type]
             n_jobs = int(config["n_jobs"])  # type: ignore[arg-type]
+
+            manager = self.job_manager
+            manager.update_message(job_id, "Preparing train/test split")
+            manager.wait_if_paused(job_id)
+            manager.raise_if_cancelled(job_id)
 
             X = dataset[features]
             y = dataset[target]
@@ -7261,12 +8000,22 @@ class FlowDataApp:
                     stratify=None,
                 )
 
+            manager.increment_job(job_id, message="Train/test split ready")
+            manager.update_message(job_id, "Computing class balance")
+            manager.wait_if_paused(job_id)
+            manager.raise_if_cancelled(job_id)
+
             class_balance_mode = self.class_balance_var.get()
             class_weight_dict: Optional[Dict[object, float]] = None
             fit_sample_weight: Optional[np.ndarray] = None
             if class_balance_mode != "None" and len(y_train) > 0:
                 class_weight_dict = self._compute_class_weight_dict(y_train)
                 fit_sample_weight = self._sample_weight_array(y_train, class_weight_dict)
+
+            manager.increment_job(job_id, message="Class balance prepared")
+            manager.update_message(job_id, "Fitting model")
+            manager.wait_if_paused(job_id)
+            manager.raise_if_cancelled(job_id)
 
             if model_name == "Random Forest":
                 payload = self._train_random_forest_model(
@@ -7360,6 +8109,12 @@ class FlowDataApp:
             else:
                 raise ValueError(f"Unsupported model '{model_name}'.")
 
+            manager.increment_job(job_id, message="Model fitted")
+            manager.update_message(job_id, "Evaluating model")
+            manager.wait_if_paused(job_id)
+            manager.raise_if_cancelled(job_id)
+
+            manager.raise_if_cancelled(job_id)
             payload.setdefault("training_time", time.time() - start_time)
             payload.setdefault("artifacts", {})
             payload.update(
@@ -7375,9 +8130,19 @@ class FlowDataApp:
                 "cv_folds": cv_folds,
                 "n_jobs": n_jobs,
             }
+            manager.increment_job(job_id, message="Finalizing results")
+            manager.raise_if_cancelled(job_id)
             self.training_queue.put({"status": "success", "payload": payload})
+            manager.mark_completed(job_id, message="Training completed")
         except Exception as exc:  # noqa: BLE001
-            self.training_queue.put({"status": "error", "message": str(exc)})
+            if isinstance(exc, BackgroundJobCancelled):
+                self.training_queue.put(
+                    {"status": "cancelled", "message": "Training cancelled."}
+                )
+                self.job_manager.mark_cancelled(job_id, "Training cancelled")
+            else:
+                self.training_queue.put({"status": "error", "message": str(exc)})
+                self.job_manager.mark_failed(job_id, f"Training failed: {exc}")
 
     def _classification_metrics(self, y_true: pd.Series, y_pred: np.ndarray, class_labels: Optional[List[str]] = None) -> tuple[Dict[str, object], np.ndarray, List[str]]:
         accuracy = accuracy_score(y_true, y_pred)
@@ -7834,8 +8599,11 @@ class FlowDataApp:
             self.root.after(200, self._check_training_queue)
             return
 
-        if message["status"] == "success":
+        status = message.get("status")
+        if status == "success":
             self._handle_training_success(message["payload"])
+        elif status == "cancelled":
+            self._handle_training_cancelled(message.get("message", "Training cancelled."))
         else:
             self._handle_training_failure(message["message"])
 
@@ -7843,6 +8611,7 @@ class FlowDataApp:
         self.training_in_progress = False
         self.training_progress.stop()
         self.train_button.configure(state="normal")
+        self.active_training_job_id = None
 
         self.trained_model = payload["model"]  # type: ignore[assignment]
         self.training_results = payload
@@ -7889,8 +8658,22 @@ class FlowDataApp:
         self.training_in_progress = False
         self.training_progress.stop()
         self.train_button.configure(state="normal")
+        self.active_training_job_id = None
         self.training_status_var.set(f"Training failed: {message}")
         messagebox.showerror("Training error", message)
+
+    def _handle_training_cancelled(self, message: str) -> None:
+        self.training_in_progress = False
+        self.training_progress.stop()
+        self.train_button.configure(state="normal")
+        self.save_model_button.configure(state="disabled")
+        self.training_status_var.set(message or "Training cancelled.")
+        self.active_training_job_id = None
+        if hasattr(self, "metrics_text") and self.metrics_text is not None:
+            self.metrics_text.configure(state="normal")
+            self.metrics_text.delete("1.0", tk.END)
+            self.metrics_text.insert("1.0", "Training cancelled.")
+            self.metrics_text.configure(state="disabled")
 
     def _update_metrics_display(self, payload: Dict[str, object]) -> None:
         if not hasattr(self, "metrics_text"):
