@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+build/
+dist/
+dist_bundle/
+*.spec
+snapshots/

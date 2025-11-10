@@ -11,10 +11,11 @@ import uuid
 from itertools import product
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -34,6 +35,13 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from packaging_tools import (
+    build_pyinstaller_bundle,
+    collect_environment_snapshot,
+    detect_default_data_paths,
+    validate_bundle_artifact,
+    write_environment_snapshot,
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -762,6 +770,9 @@ class FlowDataApp:
         self.cluster_compare_results: List[Dict[str, object]] = []
         self.cluster_compare_result_counter = 0
 
+        self.packaging_status_var = tk.StringVar(value="")
+        self._packaging_thread: Optional[Thread] = None
+
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -777,6 +788,22 @@ class FlowDataApp:
     def _build_controls(self) -> None:
         control_frame = ttk.Frame(self.root, padding=(12, 8))
         control_frame.pack(fill="x")
+
+        ttk.Button(
+            control_frame,
+            text="Build Desktop Bundle",
+            command=self.build_desktop_bundle,
+        ).pack(side="right")
+
+        ttk.Button(
+            control_frame,
+            text="Export Environment Snapshot",
+            command=self.export_environment_snapshot,
+        ).pack(side="right", padx=(0, 8))
+
+        ttk.Label(control_frame, textvariable=self.packaging_status_var).pack(
+            side="right", padx=(0, 12)
+        )
 
         ttk.Button(
             control_frame,
@@ -8095,6 +8122,107 @@ class FlowDataApp:
         ttk.Label(status_frame, textvariable=self.status_var, padding=(8, 2)).pack(
             side="left"
         )
+
+    def export_environment_snapshot(self) -> None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"flow_environment_{timestamp}.json"
+        output = filedialog.asksaveasfilename(
+            title="Export Environment Snapshot",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialdir=str(self.app_dir),
+            initialfile=default_name,
+        )
+        if not output:
+            return
+
+        self.packaging_status_var.set("Exporting environment snapshot…")
+        config_targets: List[Path] = [self.cache_dir]
+        for folder_name in ("Applications", "training_fcs"):
+            candidate = self.app_dir / folder_name
+            if candidate.exists():
+                config_targets.append(candidate)
+
+        try:
+            snapshot = collect_environment_snapshot(
+                config_paths=config_targets,
+                requirements_path=self.app_dir / "requirements.txt",
+                cwd=self.app_dir,
+            )
+            destination = write_environment_snapshot(snapshot, Path(output))
+        except Exception as exc:  # noqa: BLE001
+            self._on_snapshot_failure(str(exc))
+            return
+
+        self._on_snapshot_success(destination)
+
+    def _on_snapshot_success(self, path: Path) -> None:
+        self.packaging_status_var.set("Environment snapshot saved")
+        messagebox.showinfo(
+            "Environment Snapshot Created",
+            f"Environment details were saved to:\n{path}",
+        )
+
+    def _on_snapshot_failure(self, message: str) -> None:
+        self.packaging_status_var.set("Environment snapshot failed")
+        messagebox.showerror("Environment Snapshot Failed", message)
+
+    def _start_packaging_task(self, task: Callable[[], None]) -> None:
+        if self._packaging_thread is not None and self._packaging_thread.is_alive():
+            messagebox.showinfo(
+                "Packaging In Progress",
+                "Another packaging task is already running. Please wait for it to finish.",
+            )
+            return
+
+        self._packaging_thread = Thread(target=task, daemon=True)
+        self._packaging_thread.start()
+
+    def build_desktop_bundle(self) -> None:
+        output_dir = filedialog.askdirectory(
+            title="Select Output Directory for Desktop Bundle",
+            initialdir=str(self.app_dir),
+        )
+        if not output_dir:
+            return
+
+        destination = Path(output_dir)
+        self.packaging_status_var.set("Building desktop bundle…")
+
+        def _task() -> None:
+            try:
+                add_data = detect_default_data_paths(self.app_dir)
+                bundle_result = build_pyinstaller_bundle(
+                    self.app_dir / "app.py",
+                    destination,
+                    add_data=add_data,
+                )
+                validate_bundle_artifact(bundle_result.artifact_path)
+            except Exception as exc:  # noqa: BLE001
+                self.root.after(
+                    0,
+                    lambda msg=str(exc): self._on_bundle_failure(msg),
+                )
+                return
+
+            self.root.after(
+                0,
+                lambda path=bundle_result.artifact_path: self._on_bundle_success(path),
+            )
+
+        self._start_packaging_task(_task)
+
+    def _on_bundle_success(self, artifact_path: Path) -> None:
+        self.packaging_status_var.set("Desktop bundle ready")
+        messagebox.showinfo(
+            "Desktop Bundle Created",
+            "PyInstaller bundle created successfully.\n"
+            f"Artifact location:\n{artifact_path}",
+        )
+
+    def _on_bundle_failure(self, message: str) -> None:
+        self.packaging_status_var.set("Bundle build failed")
+        messagebox.showerror("Desktop Bundle Failed", message)
 
     def select_files(self) -> None:
         file_paths = filedialog.askopenfilenames(
