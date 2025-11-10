@@ -15,6 +15,7 @@ This desktop app helps you explore and curate large collections of flow cytometr
 - Save-time controls for trimming Random Forest out-of-bag caches to keep exported bundles lightweight when needed.
 - Clustering module with feature selection, class-aware downsampling, and configurable KMeans, Leiden, Louvain, and SOM+metaclustering pipelines.
 - Clustering visualizations including UMAP projections (colored by clusters or marker intensity) and configurable cluster/marker heatmaps.
+- Environment snapshot export and PyInstaller-based desktop bundle generation tools for reproducible deployments.
 
 ## Getting Started
 
@@ -27,6 +28,45 @@ This desktop app helps you explore and curate large collections of flow cytometr
    ```bash
    python3 app.py
    ```
+
+## Packaging & Deployment
+
+Use the built-in packaging helpers when you need to hand off the application or
+capture the exact Python environment that produced a model export.
+
+### Environment snapshots
+
+- **UI:** Click **Export Environment Snapshot** from the top control bar to save a
+  JSON file containing the Python version, dependency list (via `pip freeze`), and
+  relevant configuration metadata (cached session state and optional application
+  resources).
+- **CLI:**
+  ```bash
+  python -m packaging_tools snapshot snapshots/flow_environment.json
+  ```
+  Supply `--config` multiple times to include additional configuration paths and
+  `--env-prefix` to capture custom environment variables.
+
+### Building desktop bundles
+
+- **UI:** Select **Build Desktop Bundle** to run PyInstaller from within the
+  application. The bundle is created in the directory you choose and is validated
+  for the current platform. Each build also stores an accompanying environment
+  snapshot for auditing.
+- **CLI:**
+  ```bash
+  python -m packaging_tools bundle --output-dir dist_bundle --validate
+  ```
+  Customize the build with flags such as `--onefile`, `--icon`, or
+  `--add-data path:target` to ship additional resources. Use `python -m
+  packaging_tools validate dist_bundle/dist/FlowTrainingUI` to re-run validation
+  on any generated artifact, including bundles produced on other platforms.
+
+> **Testing bundles across platforms:** The `validate` command enforces sensible
+> defaults for Linux, macOS, and Windows artifacts (executable permissions,
+> `.app` folder structure, and `.exe` naming). Combine it with your CI matrix to
+> automatically verify the integrity of bundles produced on different operating
+> systems.
 
 ## Usage Tips
 

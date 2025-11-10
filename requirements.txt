@@ -16,4 +16,6 @@ polars>=0.20
 pyarrow>=16.0
 xgboost>=2.0
 lightgbm>=4.1
+# Packaging
+pyinstaller>=6.3
 # PyTorch is optional and should be installed separately per platform for neural-network training.
