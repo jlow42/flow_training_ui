@@ -5,7 +5,7 @@ import tkinter as tk
 import multiprocessing
 import queue
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 import random
 import uuid
 from itertools import product
@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -107,6 +107,8 @@ MAX_CENTROID_LABELS = 40
 MAX_CLUSTER_COMPARE_CATEGORIES = 30
 CSV_METADATA_SAMPLE_ROWS = 5000
 DEFAULT_CSV_CHUNKSIZE = 200_000
+DEFAULT_STREAMING_BATCH_SIZE = 50_000
+STREAMING_AUTO_ROW_THRESHOLD = 300_000
 IS_DARWIN = sys.platform == "darwin"
 
 
@@ -413,6 +415,9 @@ class FlowDataApp:
         self.cv_folds_var = tk.IntVar(value=5)
         self.n_jobs_var = tk.IntVar(value=default_jobs)
         self.training_status_var = tk.StringVar(value="Training not started.")
+        self.training_streaming_mode_var = tk.StringVar(value="Auto")
+        self.training_streaming_batch_var = tk.IntVar(value=DEFAULT_STREAMING_BATCH_SIZE)
+        self.training_streaming_message_var = tk.StringVar(value="")
         # Model-specific hyperparameters
         self.lda_solver_var = tk.StringVar(value="svd")
         self.lda_shrinkage_var = tk.StringVar(value="")
@@ -453,51 +458,62 @@ class FlowDataApp:
         self.keep_rf_oob_var = tk.BooleanVar(value=True)
         self.training_model_description_var = tk.StringVar(value="")
         self.class_balance_var.trace_add("write", lambda *_: self._mark_session_dirty())
+        self.training_streaming_mode_var.trace_add("write", lambda *_: self._mark_session_dirty())
+        self.training_streaming_batch_var.trace_add("write", lambda *_: self._mark_session_dirty())
         self.training_model_configs = {
             "Random Forest": {
                 "key": "rf",
                 "type": "supervised",
                 "description": "Ensemble of decision trees; robust to mixed feature scales and handles feature importance.",
+                "supports_partial_fit": False,
             },
             "LDA": {
                 "key": "lda",
                 "type": "supervised",
                 "description": "Linear Discriminant Analysis (generative, assumes Gaussian classes). Works best on scaled numeric features.",
+                "supports_partial_fit": False,
             },
             "SVM": {
                 "key": "svm",
                 "type": "supervised",
                 "description": "Support Vector Machine classifier with optional kernels and regularization.",
+                "supports_partial_fit": False,
             },
             "Logistic Regression": {
                 "key": "logreg",
                 "type": "supervised",
                 "description": "Scaled logistic regression with configurable solvers and penalties.",
+                "supports_partial_fit": False,
             },
             "Naive Bayes": {
                 "key": "nb",
                 "type": "supervised",
-                "description": "Gaussian Naive Bayes for fast baselines (supports sample weighting).",
+                "description": "Gaussian Naive Bayes for fast baselines (supports sample weighting and streaming partial_fit).",
+                "supports_partial_fit": True,
             },
             "XGBoost": {
                 "key": "xgb",
                 "type": "supervised",
                 "description": "Gradient boosted trees via XGBoost (requires xgboost package).",
+                "supports_partial_fit": False,
             },
             "LightGBM": {
                 "key": "lgbm",
                 "type": "supervised",
                 "description": "Gradient boosted trees via LightGBM (requires lightgbm package).",
+                "supports_partial_fit": False,
             },
             "KMeans": {
                 "key": "kmeans",
                 "type": "unsupervised",
                 "description": "Unsupervised k-means clustering with majority-vote mapping back to class labels for evaluation.",
+                "supports_partial_fit": False,
             },
             "Neural Network": {
                 "key": "nn",
                 "type": "supervised",
                 "description": "Feed-forward neural network (PyTorch) with configurable hidden layers and optional GPU acceleration.",
+                "supports_partial_fit": False,
             },
         }
 
@@ -1321,6 +1337,39 @@ class FlowDataApp:
             width=12,
         ).grid(row=1, column=3, sticky="w", padx=(12, 0))
 
+        stream_frame = ttk.LabelFrame(training_frame, text="Streaming", padding=8)
+        stream_frame.pack(fill="x", pady=(12, 0))
+
+        ttk.Label(stream_frame, text="Streaming mode").grid(row=0, column=0, sticky="w")
+        self.training_stream_mode_combo = ttk.Combobox(
+            stream_frame,
+            state="readonly",
+            values=["Auto", "On", "Off"],
+            textvariable=self.training_streaming_mode_var,
+            width=10,
+        )
+        self.training_stream_mode_combo.grid(row=1, column=0, sticky="w")
+
+        ttk.Label(stream_frame, text="Batch size (rows)").grid(
+            row=0, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Spinbox(
+            stream_frame,
+            from_=1_000,
+            to=2_000_000,
+            increment=1_000,
+            textvariable=self.training_streaming_batch_var,
+            width=10,
+        ).grid(row=1, column=1, sticky="w", padx=(12, 0))
+
+        ttk.Label(
+            stream_frame,
+            textvariable=self.training_streaming_message_var,
+            wraplength=700,
+            justify="left",
+            foreground="#555555",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
         run_meta_frame = ttk.Frame(training_frame)
         run_meta_frame.pack(fill="x", pady=(8, 0))
         ttk.Label(run_meta_frame, text="Run tags (comma-separated)").grid(row=0, column=0, sticky="w")
@@ -1803,6 +1852,17 @@ class FlowDataApp:
         frame = self.training_model_param_frames.get(selected)
         if frame is not None:
             frame.pack(fill="x", pady=(4, 0))
+        supports_streaming = self.training_model_configs.get(selected, {}).get(
+            "supports_partial_fit", False
+        )
+        if supports_streaming:
+            self.training_streaming_message_var.set(
+                "This model supports incremental partial_fit; streaming batches will be used when enabled."
+            )
+        else:
+            self.training_streaming_message_var.set(
+                "Streaming requires a model with partial_fit support; this selection will load the full dataset into memory."
+            )
 
     def _handle_training_model_selected(self, _event: Optional[tk.Event] = None) -> None:
         self._on_training_model_changed()
@@ -4548,6 +4608,7 @@ class FlowDataApp:
             "f1_macro": metrics.get("f1_macro"),
             "model_params": payload.get("config", {}).get("model_params", {}),
             "class_balance": self.class_balance_var.get(),
+            "streaming": payload.get("config", {}).get("streaming", {}),
             "tags": self._parse_tags(self.run_tags_var.get()),
             "notes": self.run_notes_var.get().strip(),
             "seed": RANDOM_STATE,
@@ -6708,6 +6769,19 @@ class FlowDataApp:
         mapped = y.map(class_weights).astype(float)
         return mapped.to_numpy(dtype=float, copy=False)
 
+    @staticmethod
+    def _class_weights_from_counts(counts: Counter) -> Dict[object, float]:
+        total = sum(counts.values())
+        n_classes = len(counts)
+        if total == 0 or n_classes == 0:
+            return {}
+        weights: Dict[object, float] = {}
+        for cls, count in counts.items():
+            if count <= 0:
+                continue
+            weights[cls] = total / (n_classes * count)
+        return weights
+
     def _reset_results_view(self) -> None:
         if not hasattr(self, "metrics_text"):
             return
@@ -7113,55 +7187,6 @@ class FlowDataApp:
             )
             return
 
-        try:
-            dataset = self._prepare_training_dataframe()
-        except ValueError as exc:
-            messagebox.showerror("Data error", str(exc))
-            return
-
-        required_columns = self.training_selection + [target_column]
-        missing_in_dataset = [
-            column for column in required_columns if column not in dataset.columns
-        ]
-        if missing_in_dataset:
-            messagebox.showerror(
-                "Missing data",
-                "The prepared dataset is missing required columns:\n"
-                + ", ".join(missing_in_dataset),
-            )
-            return
-
-        dataset = dataset[required_columns].copy()
-        dataset = dataset.dropna()
-        if dataset.empty:
-            messagebox.showerror(
-                "Empty dataset",
-                "No rows remain after dropping records with missing feature/target values.",
-            )
-            return
-
-        non_numeric_features = [
-            column
-            for column in self.training_selection
-            if not is_numeric_dtype(dataset[column])
-        ]
-        if non_numeric_features:
-            messagebox.showerror(
-                "Non-numeric features",
-                "Random forest training requires numeric feature columns. "
-                "The following selections are not numeric:\n"
-                + ", ".join(non_numeric_features),
-            )
-            return
-
-        unique_classes = dataset[target_column].nunique(dropna=True)
-        if unique_classes < 2:
-            messagebox.showerror(
-                "Insufficient classes",
-                "At least two distinct classes are required in the target column.",
-            )
-            return
-
         model_name = self.training_model_var.get()
         if not model_name or model_name not in self.training_model_configs:
             messagebox.showerror("Select model", "Choose a training model before starting.")
@@ -7196,6 +7221,99 @@ class FlowDataApp:
             n_jobs = self.total_cpu_cores
         self.n_jobs_var.set(n_jobs)
 
+        required_columns = list(dict.fromkeys(self.training_selection + [target_column]))
+        signature = self.data_engine.build_signature(
+            columns=required_columns,
+            extra={"mode": "training"},
+        )
+        streaming_mode = (self.training_streaming_mode_var.get() or "Auto").strip().lower()
+        raw_batch_value = self.training_streaming_batch_var.get()
+        streaming_batch_size = int(raw_batch_value) if raw_batch_value else DEFAULT_STREAMING_BATCH_SIZE
+        streaming_batch_size = max(streaming_batch_size, 1_000)
+        supports_streaming = self.training_model_configs.get(model_name, {}).get(
+            "supports_partial_fit", False
+        )
+        total_rows_estimate = self.data_engine.overall_row_stats().get("total_rows") or 0
+        use_streaming = False
+        if supports_streaming and streaming_mode in {"on", "auto"}:
+            if streaming_mode == "on":
+                use_streaming = True
+            else:
+                threshold = max(streaming_batch_size * 3, STREAMING_AUTO_ROW_THRESHOLD)
+                use_streaming = total_rows_estimate >= threshold
+        streaming_plan = {
+            "enabled": use_streaming,
+            "mode": streaming_mode,
+            "batch_size": streaming_batch_size,
+            "signature": signature,
+            "columns": list(required_columns),
+            "seed": RANDOM_STATE,
+        }
+
+        dataset: Optional[pd.DataFrame] = None
+        if use_streaming:
+            non_numeric_features = [
+                column
+                for column in self.training_selection
+                if not self.column_numeric_hints.get(column, False)
+            ]
+            if non_numeric_features:
+                messagebox.showerror(
+                    "Non-numeric features",
+                    "Streaming training requires numeric feature columns. "
+                    "The following selections are not numeric:\n"
+                    + ", ".join(non_numeric_features),
+                )
+                return
+        else:
+            try:
+                dataset = self._prepare_training_dataframe()
+            except ValueError as exc:
+                messagebox.showerror("Data error", str(exc))
+                return
+
+            missing_in_dataset = [
+                column for column in required_columns if column not in dataset.columns
+            ]
+            if missing_in_dataset:
+                messagebox.showerror(
+                    "Missing data",
+                    "The prepared dataset is missing required columns:\n"
+                    + ", ".join(missing_in_dataset),
+                )
+                return
+
+            dataset = dataset[required_columns].copy()
+            dataset = dataset.dropna()
+            if dataset.empty:
+                messagebox.showerror(
+                    "Empty dataset",
+                    "No rows remain after dropping records with missing feature/target values.",
+                )
+                return
+
+            non_numeric_features = [
+                column
+                for column in self.training_selection
+                if not is_numeric_dtype(dataset[column])
+            ]
+            if non_numeric_features:
+                messagebox.showerror(
+                    "Non-numeric features",
+                    "Training requires numeric feature columns. "
+                    "The following selections are not numeric:\n"
+                    + ", ".join(non_numeric_features),
+                )
+                return
+
+            unique_classes = dataset[target_column].nunique(dropna=True)
+            if unique_classes < 2:
+                messagebox.showerror(
+                    "Insufficient classes",
+                    "At least two distinct classes are required in the target column.",
+                )
+                return
+
         config = {
             "model_name": model_name,
             "model_params": model_params,
@@ -7204,6 +7322,8 @@ class FlowDataApp:
             "n_jobs": n_jobs,
             "features": list(self.training_selection),
             "target": target_column,
+            "streaming": streaming_plan,
+            "class_balance_mode": self.class_balance_var.get(),
         }
 
         self.training_results = {}
@@ -7211,7 +7331,8 @@ class FlowDataApp:
         self.training_in_progress = True
         self.train_button.configure(state="disabled")
         self.training_progress.start(12)
-        self.training_status_var.set("Training in progress…")
+        status_text = "Streaming training in progress…" if use_streaming else "Training in progress…"
+        self.training_status_var.set(status_text)
         if hasattr(self, "metrics_text"):
             self.metrics_text.configure(state="normal")
             self.metrics_text.delete("1.0", tk.END)
@@ -7230,7 +7351,7 @@ class FlowDataApp:
         self.training_thread.start()
         self.root.after(150, self._check_training_queue)
 
-    def _train_model_worker(self, config: Dict[str, object], dataset: pd.DataFrame) -> None:
+    def _train_model_worker(self, config: Dict[str, object], dataset: Optional[pd.DataFrame]) -> None:
         try:
             start_time = time.time()
             model_name = config["model_name"]
@@ -7240,125 +7361,140 @@ class FlowDataApp:
             test_size = float(config["test_size"])  # type: ignore[arg-type]
             cv_folds = int(config["cv_folds"])  # type: ignore[arg-type]
             n_jobs = int(config["n_jobs"])  # type: ignore[arg-type]
+            streaming_cfg = config.get("streaming", {})
+            use_streaming = bool(streaming_cfg.get("enabled"))
+            class_balance_mode = str(config.get("class_balance_mode", "None"))
 
-            X = dataset[features]
-            y = dataset[target]
-            stratify = y if y.nunique() > 1 else None
-            try:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X,
-                    y,
-                    test_size=test_size,
-                    random_state=RANDOM_STATE,
-                    stratify=stratify,
-                )
-            except ValueError:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X,
-                    y,
-                    test_size=test_size,
-                    random_state=RANDOM_STATE,
-                    stratify=None,
-                )
-
-            class_balance_mode = self.class_balance_var.get()
-            class_weight_dict: Optional[Dict[object, float]] = None
-            fit_sample_weight: Optional[np.ndarray] = None
-            if class_balance_mode != "None" and len(y_train) > 0:
-                class_weight_dict = self._compute_class_weight_dict(y_train)
-                fit_sample_weight = self._sample_weight_array(y_train, class_weight_dict)
-
-            if model_name == "Random Forest":
-                payload = self._train_random_forest_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
+            if use_streaming:
+                payload = self._train_model_streaming(
+                    model_name,
                     params,
-                    cv_folds,
-                    n_jobs,
-                    class_weight_dict,
-                    fit_sample_weight,
-                )
-            elif model_name == "LDA":
-                payload = self._train_lda_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    cv_folds,
-                    n_jobs,
-                    fit_sample_weight,
-                )
-            elif model_name == "SVM":
-                payload = self._train_svm_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    cv_folds,
-                    n_jobs,
-                    class_weight_dict,
-                    fit_sample_weight,
-                )
-            elif model_name == "Logistic Regression":
-                payload = self._train_logistic_regression_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    cv_folds,
-                    n_jobs,
-                    class_weight_dict,
-                    fit_sample_weight,
-                )
-            elif model_name == "Naive Bayes":
-                payload = self._train_naive_bayes_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    fit_sample_weight,
-                )
-            elif model_name == "XGBoost":
-                payload = self._train_xgboost_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    class_weight_dict,
-                    fit_sample_weight,
-                    n_jobs,
-                )
-            elif model_name == "LightGBM":
-                payload = self._train_lightgbm_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    class_weight_dict,
-                    fit_sample_weight,
-                    n_jobs,
-                )
-            elif model_name == "KMeans":
-                payload = self._train_kmeans_model(X_train, X_test, y_train, y_test, params)
-            elif model_name == "Neural Network":
-                payload = self._train_neural_network_model(
-                    X_train,
-                    X_test,
-                    y_train,
-                    y_test,
-                    params,
-                    class_weight_dict,
+                    features,
+                    target,
+                    streaming_cfg,
+                    test_size,
+                    class_balance_mode,
                 )
             else:
-                raise ValueError(f"Unsupported model '{model_name}'.")
+                if dataset is None:
+                    raise ValueError("Prepared dataset is required for non-streaming training.")
+                X = dataset[features]
+                y = dataset[target]
+                stratify = y if y.nunique() > 1 else None
+                try:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X,
+                        y,
+                        test_size=test_size,
+                        random_state=RANDOM_STATE,
+                        stratify=stratify,
+                    )
+                except ValueError:
+                    X_train, X_test, y_train, y_test = train_test_split(
+                        X,
+                        y,
+                        test_size=test_size,
+                        random_state=RANDOM_STATE,
+                        stratify=None,
+                    )
+
+                class_weight_dict: Optional[Dict[object, float]] = None
+                fit_sample_weight: Optional[np.ndarray] = None
+                if class_balance_mode != "None" and len(y_train) > 0:
+                    class_weight_dict = self._compute_class_weight_dict(y_train)
+                    fit_sample_weight = self._sample_weight_array(y_train, class_weight_dict)
+
+                if model_name == "Random Forest":
+                    payload = self._train_random_forest_model(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        params,
+                        cv_folds,
+                        n_jobs,
+                        class_weight_dict,
+                        fit_sample_weight,
+                    )
+                elif model_name == "LDA":
+                    payload = self._train_lda_model(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        params,
+                        cv_folds,
+                        n_jobs,
+                        fit_sample_weight,
+                    )
+                elif model_name == "SVM":
+                    payload = self._train_svm_model(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        params,
+                        cv_folds,
+                        n_jobs,
+                        class_weight_dict,
+                        fit_sample_weight,
+                    )
+                elif model_name == "Logistic Regression":
+                    payload = self._train_logistic_regression_model(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        params,
+                        cv_folds,
+                        n_jobs,
+                        class_weight_dict,
+                        fit_sample_weight,
+                    )
+                elif model_name == "Naive Bayes":
+                    payload = self._train_naive_bayes_model(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        params,
+                        fit_sample_weight,
+                    )
+                elif model_name == "XGBoost":
+                    payload = self._train_xgboost_model(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        params,
+                        class_weight_dict,
+                        fit_sample_weight,
+                        n_jobs,
+                    )
+                elif model_name == "LightGBM":
+                    payload = self._train_lightgbm_model(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        params,
+                        class_weight_dict,
+                        fit_sample_weight,
+                        n_jobs,
+                    )
+                elif model_name == "KMeans":
+                    payload = self._train_kmeans_model(X_train, X_test, y_train, y_test, params)
+                elif model_name == "Neural Network":
+                    payload = self._train_neural_network_model(
+                        X_train,
+                        X_test,
+                        y_train,
+                        y_test,
+                        params,
+                        class_weight_dict,
+                    )
+                else:
+                    raise ValueError(f"Unsupported model '{model_name}'.")
 
             payload.setdefault("training_time", time.time() - start_time)
             payload.setdefault("artifacts", {})
@@ -7374,6 +7510,11 @@ class FlowDataApp:
                 "test_size": test_size,
                 "cv_folds": cv_folds,
                 "n_jobs": n_jobs,
+                "streaming": {
+                    "enabled": bool(streaming_cfg.get("enabled")),
+                    "mode": streaming_cfg.get("mode"),
+                    "batch_size": streaming_cfg.get("batch_size"),
+                },
             }
             self.training_queue.put({"status": "success", "payload": payload})
         except Exception as exc:  # noqa: BLE001
@@ -7396,6 +7537,91 @@ class FlowDataApp:
             "report_dict": report_dict,
         }
         return metrics, conf_matrix, class_labels
+
+    def _classification_metrics_from_confusion(
+        self,
+        confusion: np.ndarray,
+        classes: Sequence[object],
+    ) -> tuple[Dict[str, object], np.ndarray, List[object]]:
+        confusion_array = np.asarray(confusion, dtype=np.int64)
+        class_list = list(classes)
+        total = int(confusion_array.sum())
+        accuracy = float(np.trace(confusion_array)) / total if total else 0.0
+
+        precisions: List[float] = []
+        recalls: List[float] = []
+        f1_scores: List[float] = []
+        supports: List[int] = []
+
+        report_lines = ["              precision    recall  f1-score   support"]
+        report_dict: Dict[str, Dict[str, float]] = {}
+
+        for idx, label in enumerate(class_list):
+            support = int(confusion_array[idx, :].sum())
+            pred_sum = int(confusion_array[:, idx].sum())
+            true_positive = int(confusion_array[idx, idx])
+            precision = true_positive / pred_sum if pred_sum else 0.0
+            recall = true_positive / support if support else 0.0
+            f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+
+            precisions.append(precision)
+            recalls.append(recall)
+            f1_scores.append(f1)
+            supports.append(support)
+
+            label_str = str(label)
+            report_lines.append(
+                f"{label_str:>14} {precision:>9.3f} {recall:>9.3f} {f1:>9.3f} {support:>9}"
+            )
+            report_dict[label_str] = {
+                "precision": precision,
+                "recall": recall,
+                "f1-score": f1,
+                "support": support,
+            }
+
+        macro_precision = float(np.mean(precisions)) if precisions else 0.0
+        macro_recall = float(np.mean(recalls)) if recalls else 0.0
+        macro_f1 = float(np.mean(f1_scores)) if f1_scores else 0.0
+        if total:
+            weighted_precision = float(np.average(precisions, weights=supports))
+            weighted_recall = float(np.average(recalls, weights=supports))
+            weighted_f1 = float(np.average(f1_scores, weights=supports))
+        else:
+            weighted_precision = weighted_recall = weighted_f1 = 0.0
+
+        report_lines.append("")
+        report_lines.append(f"{'accuracy':>9} {accuracy:>24.3f} {total:>9}")
+        report_lines.append(
+            f"{'macro avg':>14} {macro_precision:>9.3f} {macro_recall:>9.3f} {macro_f1:>9.3f} {total:>9}"
+        )
+        report_lines.append(
+            f"{'weighted avg':>14} {weighted_precision:>9.3f} {weighted_recall:>9.3f} {weighted_f1:>9.3f} {total:>9}"
+        )
+        report_text = "\n".join(report_lines)
+
+        report_dict["accuracy"] = accuracy
+        report_dict["macro avg"] = {
+            "precision": macro_precision,
+            "recall": macro_recall,
+            "f1-score": macro_f1,
+            "support": total,
+        }
+        report_dict["weighted avg"] = {
+            "precision": weighted_precision,
+            "recall": weighted_recall,
+            "f1-score": weighted_f1,
+            "support": total,
+        }
+
+        metrics = {
+            "accuracy": accuracy,
+            "f1_macro": macro_f1,
+            "f1_weighted": weighted_f1,
+            "report_text": report_text,
+            "report_dict": report_dict,
+        }
+        return metrics, confusion_array, class_list
 
     def _perform_cross_validation(self, estimator, X_train, y_train, cv_folds: int, n_jobs: int) -> tuple[Optional[np.ndarray], str]:
         if cv_folds < 2 or len(y_train) < cv_folds:
@@ -7622,6 +7848,178 @@ class FlowDataApp:
             "test_rows": len(X_test),
             "cv_scores": None,
             "cv_warning": "",
+            "artifacts": {},
+        }
+
+    def _train_model_streaming(
+        self,
+        model_name: str,
+        params: Dict[str, object],
+        features: List[str],
+        target: str,
+        streaming_cfg: Dict[str, object],
+        test_size: float,
+        class_balance_mode: str,
+    ) -> Dict[str, object]:
+        if model_name == "Naive Bayes":
+            return self._train_naive_bayes_streaming(
+                params,
+                features,
+                target,
+                streaming_cfg,
+                test_size,
+                class_balance_mode,
+            )
+        raise ValueError(
+            f"Streaming is not available for '{model_name}'. Disable streaming to continue."
+        )
+
+    def _train_naive_bayes_streaming(
+        self,
+        params: Dict[str, object],
+        features: List[str],
+        target: str,
+        streaming_cfg: Dict[str, object],
+        test_size: float,
+        class_balance_mode: str,
+    ) -> Dict[str, object]:
+        signature = str(streaming_cfg.get("signature"))
+        columns = list(streaming_cfg.get("columns") or [])
+        if target not in columns:
+            columns.append(target)
+        batch_size = int(streaming_cfg.get("batch_size") or DEFAULT_STREAMING_BATCH_SIZE)
+        batch_size = max(batch_size, 1_000)
+        seed = int(streaming_cfg.get("seed") or RANDOM_STATE)
+
+        def _batch_iterator() -> Iterator[pd.DataFrame]:
+            return self.data_engine.stream_dataset(
+                signature=signature,
+                columns=columns,
+                batch_size=batch_size,
+            )
+
+        rng = np.random.default_rng(seed)
+        train_counts: Counter = Counter()
+        classes_seen: Set[object] = set()
+        total_rows = 0
+        train_rows = 0
+        test_rows = 0
+
+        for chunk in _batch_iterator():
+            chunk = chunk.dropna(subset=columns)
+            if chunk.empty:
+                continue
+            mask = rng.random(len(chunk)) < test_size
+            train_chunk = chunk.loc[~mask]
+            test_chunk = chunk.loc[mask]
+            if not train_chunk.empty:
+                class_values = train_chunk[target]
+                counts = class_values.value_counts(dropna=False).to_dict()
+                train_counts.update({key: int(val) for key, val in counts.items()})
+                classes_seen.update(class_values.unique().tolist())
+                train_rows += len(train_chunk)
+            if not test_chunk.empty:
+                classes_seen.update(test_chunk[target].unique().tolist())
+                test_rows += len(test_chunk)
+            total_rows += len(chunk)
+
+        if total_rows == 0:
+            raise ValueError(
+                "Prepared dataset contains no rows after dropping records with missing feature/target values."
+            )
+        if len(classes_seen) < 2:
+            raise ValueError("At least two distinct classes are required in the target column.")
+        if train_rows == 0:
+            raise ValueError(
+                "Streaming configuration produced zero training rows. Reduce the test split or disable streaming."
+            )
+        missing_training_classes = [
+            cls for cls in classes_seen if cls not in train_counts
+        ]
+        if missing_training_classes:
+            formatted = ", ".join(str(cls) for cls in sorted(missing_training_classes, key=str))
+            raise ValueError(
+                "Streaming split allocated no training samples to the following classes: "
+                f"{formatted}. Reduce the test split or disable streaming."
+            )
+
+        class_weight_dict: Optional[Dict[object, float]] = None
+        if class_balance_mode != "None":
+            class_weight_dict = self._class_weights_from_counts(train_counts)
+
+        classes_list = sorted(classes_seen, key=lambda value: str(value))
+
+        rng = np.random.default_rng(seed)
+        model = GaussianNB(var_smoothing=params["var_smoothing"])
+        first_batch = True
+        for chunk in _batch_iterator():
+            chunk = chunk.dropna(subset=columns)
+            if chunk.empty:
+                continue
+            mask = rng.random(len(chunk)) < test_size
+            train_chunk = chunk.loc[~mask]
+            if train_chunk.empty:
+                continue
+            X_chunk = train_chunk[features].to_numpy(dtype=float, copy=False)
+            y_chunk = train_chunk[target].to_numpy()
+            sample_weight: Optional[np.ndarray]
+            if class_weight_dict:
+                sample_weight = np.array(
+                    [class_weight_dict[value] for value in y_chunk],
+                    dtype=float,
+                )
+            else:
+                sample_weight = None
+            if first_batch:
+                model.partial_fit(
+                    X_chunk,
+                    y_chunk,
+                    classes=np.array(classes_list, dtype=object),
+                    sample_weight=sample_weight,
+                )
+                first_batch = False
+            else:
+                model.partial_fit(X_chunk, y_chunk, sample_weight=sample_weight)
+
+        rng = np.random.default_rng(seed)
+        class_to_index = {label: idx for idx, label in enumerate(classes_list)}
+        confusion = np.zeros((len(classes_list), len(classes_list)), dtype=np.int64)
+        for chunk in _batch_iterator():
+            chunk = chunk.dropna(subset=columns)
+            if chunk.empty:
+                continue
+            mask = rng.random(len(chunk)) < test_size
+            test_chunk = chunk.loc[mask]
+            if test_chunk.empty:
+                continue
+            X_test = test_chunk[features].to_numpy(dtype=float, copy=False)
+            y_true = test_chunk[target].to_numpy()
+            predictions = model.predict(X_test)
+            for truth, pred in zip(y_true, predictions):
+                true_idx = class_to_index[truth]
+                pred_idx = class_to_index[pred]
+                confusion[true_idx, pred_idx] += 1
+
+        metrics, conf_matrix, class_labels = self._classification_metrics_from_confusion(
+            confusion,
+            classes_list,
+        )
+        metrics.setdefault("extra_status", "Streaming partial_fit completed.")
+        metrics.setdefault(
+            "extra_lines", []
+        ).append(
+            f"Streaming batches: {batch_size:,} rows, training rows: {train_rows:,}, test rows: {test_rows:,}."
+        )
+        return {
+            "model": model,
+            "metrics": metrics,
+            "confusion_matrix": conf_matrix,
+            "classes": class_labels,
+            "feature_importances": [],
+            "train_rows": train_rows,
+            "test_rows": test_rows,
+            "cv_scores": None,
+            "cv_warning": "Cross-validation is unavailable during streaming training.",
             "artifacts": {},
         }
 
@@ -8444,6 +8842,16 @@ class FlowDataApp:
         balance = state.get("class_balance")
         if balance:
             self.class_balance_var.set(balance)
+        streaming_state = state.get("streaming") or {}
+        mode = streaming_state.get("mode")
+        if mode:
+            self.training_streaming_mode_var.set(mode)
+        batch_size = streaming_state.get("batch_size")
+        if batch_size:
+            try:
+                self.training_streaming_batch_var.set(int(batch_size))
+            except (TypeError, ValueError):
+                pass
         model = state.get("model")
         if model and model in self.training_model_configs:
             self.training_model_var.set(model)
@@ -8468,6 +8876,10 @@ class FlowDataApp:
                 "target": self.target_column_var.get(),
                 "model": self.training_model_var.get(),
                 "class_balance": self.class_balance_var.get(),
+                "streaming": {
+                    "mode": self.training_streaming_mode_var.get(),
+                    "batch_size": int(self.training_streaming_batch_var.get() or 0),
+                },
             },
         }
         try:
