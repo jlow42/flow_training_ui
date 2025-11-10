@@ -34,6 +34,18 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from theme import (
+    APP_THEMES,
+    DEFAULT_FIGURE_STYLE,
+    DEFAULT_THEME,
+    FIGURE_STYLE_PRESETS,
+    apply_figure_style,
+    apply_theme,
+    configure_global_palette,
+    get_color_cycle,
+    get_sequential_cmap,
+    get_theme_colors,
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -346,6 +358,29 @@ class FlowDataApp:
         self.root = root
         self.root.title("Flow Cytometry Data Preparation")
         self.root.geometry("1100x700")
+
+        self.style = ttk.Style()
+        self.theme_var = tk.StringVar(value=DEFAULT_THEME)
+        self.figure_style_var = tk.StringVar(value=DEFAULT_FIGURE_STYLE)
+        self.theme_display_var = tk.StringVar(
+            value=APP_THEMES[self.theme_var.get()]["label"]
+        )
+        self.figure_style_display_var = tk.StringVar(
+            value=FIGURE_STYLE_PRESETS[self.figure_style_var.get()]["label"]
+        )
+        self.figure_registry: Dict[str, Dict[str, object]] = {}
+        self.themable_text_widgets: List[tk.Text] = []
+        self.themable_listboxes: List[tk.Listbox] = []
+        self.themable_labels: List[tuple[tk.Widget, str]] = []
+        self.training_missing_indexes: Set[int] = set()
+        self.clustering_missing_indexes: Set[int] = set()
+        self.current_theme_colors = get_theme_colors(self.theme_var.get())
+        self._update_color_resources()
+        apply_theme(self.root, self.style, self.theme_var.get())
+        self.theme_var.trace_add("write", lambda *_: self._on_theme_changed())
+        self.figure_style_var.trace_add(
+            "write", lambda *_: self._on_figure_style_changed()
+        )
 
         self.app_dir = Path(__file__).resolve().parent
         self.cache_dir = self.app_dir / ".flow_cache"
@@ -769,6 +804,7 @@ class FlowDataApp:
         self._build_summary()
         self._build_notebook()
         self._build_status_bar()
+        self._apply_theme_to_custom_widgets()
 
         self._load_run_registry()
         self.root.after(400, self._load_session_state)
@@ -788,6 +824,39 @@ class FlowDataApp:
         ttk.Label(control_frame, textvariable=self.files_loaded_var).pack(
             side="left", padx=(12, 0)
         )
+
+        actions_frame = ttk.Frame(control_frame)
+        actions_frame.pack(side="right")
+
+        ttk.Button(
+            actions_frame,
+            text="Export Figures…",
+            command=self._bulk_export_figures,
+        ).pack(side="right")
+
+        figure_style_combo = ttk.Combobox(
+            actions_frame,
+            state="readonly",
+            textvariable=self.figure_style_display_var,
+            values=[cfg["label"] for cfg in FIGURE_STYLE_PRESETS.values()],
+            width=14,
+        )
+        figure_style_combo.pack(side="right", padx=(8, 0))
+        figure_style_combo.bind(
+            "<<ComboboxSelected>>", self._on_figure_style_combo_selected
+        )
+        ttk.Label(actions_frame, text="Figure style").pack(side="right", padx=(0, 6))
+
+        theme_combo = ttk.Combobox(
+            actions_frame,
+            state="readonly",
+            textvariable=self.theme_display_var,
+            values=[cfg["label"] for cfg in APP_THEMES.values()],
+            width=10,
+        )
+        theme_combo.pack(side="right", padx=(8, 0))
+        theme_combo.bind("<<ComboboxSelected>>", self._on_theme_combo_selected)
+        ttk.Label(actions_frame, text="Theme").pack(side="right", padx=(0, 6))
 
     def _build_summary(self) -> None:
         summary_frame = ttk.Frame(self.root, padding=(12, 0))
@@ -843,6 +912,203 @@ class FlowDataApp:
         self._init_clustering_explorer_tab(clustering_notebook)
         self._init_clustering_annotation_tab(clustering_notebook)
         self._init_clustering_comparison_tab(clustering_notebook)
+
+    def _on_theme_combo_selected(self, _event: Optional[tk.Event] = None) -> None:
+        label = self.theme_display_var.get()
+        for key, config in APP_THEMES.items():
+            if config.get("label") == label:
+                if self.theme_var.get() != key:
+                    self.theme_var.set(key)
+                return
+
+    def _on_figure_style_combo_selected(
+        self, _event: Optional[tk.Event] = None
+    ) -> None:
+        label = self.figure_style_display_var.get()
+        for key, config in FIGURE_STYLE_PRESETS.items():
+            if config.get("label") == label:
+                if self.figure_style_var.get() != key:
+                    self.figure_style_var.set(key)
+                return
+
+    def _on_theme_changed(self) -> None:
+        self.current_theme_colors = get_theme_colors(self.theme_var.get())
+        apply_theme(self.root, self.style, self.theme_var.get())
+        self.theme_display_var.set(APP_THEMES[self.theme_var.get()]["label"])
+        self._update_color_resources()
+        self._apply_theme_to_custom_widgets()
+        self._refresh_all_figure_styles()
+
+    def _on_figure_style_changed(self) -> None:
+        self.figure_style_display_var.set(
+            FIGURE_STYLE_PRESETS[self.figure_style_var.get()]["label"]
+        )
+        self._update_color_resources()
+        self._refresh_all_figure_styles()
+
+    def _update_color_resources(self) -> None:
+        configure_global_palette(self.figure_style_var.get(), self.theme_var.get())
+        self.color_palette = get_color_cycle(
+            self.figure_style_var.get(), self.theme_var.get()
+        )
+        self.sequential_cmap = get_sequential_cmap(self.theme_var.get())
+
+    def _apply_theme_to_custom_widgets(self) -> None:
+        for widget in list(self.themable_text_widgets):
+            if not self._style_text_widget(widget):
+                self.themable_text_widgets.remove(widget)
+        for listbox in list(self.themable_listboxes):
+            if not self._style_listbox(listbox):
+                self.themable_listboxes.remove(listbox)
+        updated_labels: List[tuple[tk.Widget, str]] = []
+        for widget, role in self.themable_labels:
+            if widget.winfo_exists() and self._apply_role_color(widget, role):
+                updated_labels.append((widget, role))
+        self.themable_labels = updated_labels
+        self._apply_training_missing_colors()
+        self._apply_clustering_missing_colors()
+
+    def _style_text_widget(self, widget: tk.Text) -> bool:
+        if not widget.winfo_exists():
+            return False
+        colors = self.current_theme_colors
+        widget.configure(
+            background=colors.surface,
+            foreground=colors.text,
+            insertbackground=colors.text,
+            highlightbackground=colors.border,
+            highlightcolor=colors.accent,
+        )
+        return True
+
+    def _style_listbox(self, listbox: tk.Listbox) -> bool:
+        if not listbox.winfo_exists():
+            return False
+        colors = self.current_theme_colors
+        listbox.configure(
+            background=colors.surface,
+            foreground=colors.text,
+            selectbackground=colors.accent,
+            selectforeground=colors.surface,
+            highlightbackground=colors.border,
+            highlightcolor=colors.accent,
+            bd=0,
+        )
+        return True
+
+    def _register_themable_text(self, widget: tk.Text) -> None:
+        self.themable_text_widgets.append(widget)
+        self._style_text_widget(widget)
+
+    def _register_listbox(self, widget: tk.Listbox) -> None:
+        self.themable_listboxes.append(widget)
+        self._style_listbox(widget)
+
+    def _register_colored_widget(self, widget: tk.Widget, role: str) -> None:
+        self.themable_labels.append((widget, role))
+        self._apply_role_color(widget, role)
+
+    def _apply_role_color(self, widget: tk.Widget, role: str) -> bool:
+        colors = self.current_theme_colors
+        color_map = {
+            "muted": colors.muted_text,
+            "error": colors.error,
+            "accent": colors.accent,
+        }
+        color = color_map.get(role, colors.text)
+        try:
+            widget.configure(foreground=color)
+        except tk.TclError:
+            return False
+        return True
+
+    def _apply_training_missing_colors(self) -> None:
+        if not hasattr(self, "training_listbox"):
+            return
+        colors = self.current_theme_colors
+        total_items = self.training_listbox.size()
+        for index in range(total_items):
+            color = colors.error if index in self.training_missing_indexes else colors.text
+            try:
+                self.training_listbox.itemconfig(index, foreground=color)
+            except tk.TclError:
+                continue
+
+    def _apply_clustering_missing_colors(self) -> None:
+        if not hasattr(self, "clustering_listbox"):
+            return
+        colors = self.current_theme_colors
+        total_items = self.clustering_listbox.size()
+        for index in range(total_items):
+            color = colors.error if index in self.clustering_missing_indexes else colors.text
+            try:
+                self.clustering_listbox.itemconfig(index, foreground=color)
+            except tk.TclError:
+                continue
+
+    def _register_figure(
+        self,
+        key: str,
+        figure: Figure,
+        default_filename: str,
+        canvas: Optional[FigureCanvasTkAgg] = None,
+    ) -> None:
+        self.figure_registry[key] = {
+            "figure": figure,
+            "filename": default_filename,
+            "canvas": canvas,
+        }
+        self._style_figure(figure)
+
+    def _style_figure(self, figure: Figure) -> None:
+        apply_figure_style(figure, self.figure_style_var.get(), self.theme_var.get())
+
+    def _refresh_all_figure_styles(self) -> None:
+        for info in self.figure_registry.values():
+            figure = info.get("figure")
+            if isinstance(figure, Figure):
+                self._style_figure(figure)
+                canvas = info.get("canvas")
+                if hasattr(canvas, "draw_idle"):
+                    try:
+                        canvas.draw_idle()
+                    except Exception:
+                        continue
+
+    def _bulk_export_figures(self) -> None:
+        if not self.figure_registry:
+            messagebox.showinfo(
+                "No figures",
+                "There are no figures registered for export yet.",
+            )
+            return
+        export_dir = filedialog.askdirectory(title="Export figures")
+        if not export_dir:
+            return
+        export_path = Path(export_dir)
+        exported = 0
+        failures: List[str] = []
+        for info in self.figure_registry.values():
+            figure = info.get("figure")
+            filename = info.get("filename")
+            if not isinstance(figure, Figure) or not isinstance(filename, str):
+                continue
+            self._style_figure(figure)
+            try:
+                figure.savefig(export_path / filename, bbox_inches="tight")
+                exported += 1
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{filename}: {exc}")
+        if failures:
+            messagebox.showwarning(
+                "Export completed with warnings",
+                "\n".join([f"Exported {exported} figures.", *failures]),
+            )
+        else:
+            messagebox.showinfo(
+                "Export complete",
+                f"Exported {exported} figures to {export_path}",
+            )
 
     def _init_files_tab(self, notebook: ttk.Notebook) -> None:
         container = ttk.Frame(notebook)
@@ -971,10 +1237,10 @@ class FlowDataApp:
             height=6,
             wrap="word",
             state="disabled",
-            background=self.root.cget("background"),
             relief="flat",
         )
         summary_text.pack(fill="both", expand=True)
+        self._register_themable_text(summary_text)
         self.quality_summary_text = summary_text
 
     def _init_training_setup_tab(self, notebook: ttk.Notebook) -> None:
@@ -1009,6 +1275,7 @@ class FlowDataApp:
             height=10,
         )
         self.training_listbox.pack(side="left", fill="both", expand=True)
+        self._register_listbox(self.training_listbox)
         self.training_listbox.bind(
             "<<ListboxSelect>>", lambda _evt: self._on_training_selection_changed()
         )
@@ -1036,14 +1303,15 @@ class FlowDataApp:
             command=lambda: self.training_listbox.selection_clear(0, tk.END),
         ).pack(side="left", padx=(8, 0))
 
-        ttk.Label(feature_frame, textvariable=self.training_hint_var).pack(
-            anchor="w", pady=(8, 0)
-        )
-        ttk.Label(
+        hint_label = ttk.Label(feature_frame, textvariable=self.training_hint_var)
+        hint_label.pack(anchor="w", pady=(8, 0))
+        self._register_colored_widget(hint_label, "muted")
+        missing_label = ttk.Label(
             feature_frame,
             textvariable=self.training_missing_var,
-            foreground="red",
-        ).pack(anchor="w")
+        )
+        missing_label.pack(anchor="w")
+        self._register_colored_widget(missing_label, "error")
 
         target_frame = ttk.LabelFrame(setup_tab, text="Classification Target", padding=12)
         target_frame.pack(fill="both", expand=True, pady=(12, 0))
@@ -1062,15 +1330,18 @@ class FlowDataApp:
         self.target_combo.pack(anchor="w", pady=(6, 0), fill="x")
         self.target_combo.bind("<<ComboboxSelected>>", self.on_target_column_selected)
 
-        ttk.Label(target_frame, textvariable=self.target_info_var, wraplength=650).pack(
-            anchor="w", pady=(8, 0)
+        info_label = ttk.Label(
+            target_frame, textvariable=self.target_info_var, wraplength=650
         )
-        ttk.Label(
+        info_label.pack(anchor="w", pady=(8, 0))
+        self._register_colored_widget(info_label, "muted")
+        target_missing_label = ttk.Label(
             target_frame,
             textvariable=self.target_missing_var,
-            foreground="red",
             wraplength=650,
-        ).pack(anchor="w")
+        )
+        target_missing_label.pack(anchor="w")
+        self._register_colored_widget(target_missing_label, "error")
 
         totals_frame = ttk.Frame(target_frame)
         totals_frame.pack(fill="both", expand=True, pady=(8, 0))
@@ -1256,13 +1527,14 @@ class FlowDataApp:
             "<<ComboboxSelected>>", self._handle_training_model_selected
         )
 
-        ttk.Label(
+        description_label = ttk.Label(
             training_frame,
             textvariable=self.training_model_description_var,
             wraplength=700,
             justify="left",
-            foreground="#444444",
-        ).pack(anchor="w", pady=(4, 6))
+        )
+        description_label.pack(anchor="w", pady=(4, 6))
+        self._register_colored_widget(description_label, "muted")
 
         self.training_model_param_container = ttk.Frame(training_frame)
         self.training_model_param_container.pack(fill="x", pady=(4, 0))
@@ -1341,13 +1613,14 @@ class FlowDataApp:
             text="Keep Random Forest OOB caches when saving",
             variable=self.keep_rf_oob_var,
         ).grid(row=0, column=0, sticky="w")
-        ttk.Label(
+        save_hint = ttk.Label(
             save_frame,
             text="Uncheck to strip out-of-bag prediction matrices from Random Forest models before exporting to shrink file size.",
             wraplength=680,
             justify="left",
-            foreground="#555555",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        )
+        save_hint.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self._register_colored_widget(save_hint, "muted")
 
         controls_frame = ttk.Frame(training_frame)
         controls_frame.pack(fill="x", pady=(12, 0))
@@ -1573,11 +1846,12 @@ class FlowDataApp:
             padding=8,
         )
         if XGBClassifier is None:
-            ttk.Label(
+            xgb_label = ttk.Label(
                 xgb_frame,
                 text="Install the 'xgboost' package to enable this model.",
-                foreground="red",
-            ).grid(row=0, column=0, sticky="w")
+            )
+            xgb_label.grid(row=0, column=0, sticky="w")
+            self._register_colored_widget(xgb_label, "error")
         else:
             ttk.Label(xgb_frame, text="Trees").grid(row=0, column=0, sticky="w")
             ttk.Spinbox(
@@ -1636,11 +1910,12 @@ class FlowDataApp:
             padding=8,
         )
         if lgb is None:
-            ttk.Label(
+            lgb_label = ttk.Label(
                 lgb_frame,
                 text="Install the 'lightgbm' package to enable this model.",
-                foreground="red",
-            ).grid(row=0, column=0, sticky="w")
+            )
+            lgb_label.grid(row=0, column=0, sticky="w")
+            self._register_colored_widget(lgb_label, "error")
         else:
             ttk.Label(lgb_frame, text="Trees").grid(row=0, column=0, sticky="w")
             ttk.Spinbox(
@@ -1901,6 +2176,7 @@ class FlowDataApp:
             width=40,
         )
         self.clustering_filter_values_listbox.pack(side="left", fill="both", expand=True)
+        self._register_listbox(self.clustering_filter_values_listbox)
         cat_scroll = ttk.Scrollbar(
             self.clustering_filter_categorical_frame,
             orient="vertical",
@@ -1985,6 +2261,7 @@ class FlowDataApp:
             height=10,
         )
         self.clustering_listbox.pack(side="left", fill="both", expand=True)
+        self._register_listbox(self.clustering_listbox)
         self.clustering_listbox.bind(
             "<<ListboxSelect>>", lambda _evt: self._on_clustering_selection_changed()
         )
@@ -2016,14 +2293,15 @@ class FlowDataApp:
             command=lambda: self.clustering_listbox.selection_clear(0, tk.END),
         ).pack(side="left", padx=(8, 0))
 
-        ttk.Label(feature_frame, textvariable=self.clustering_hint_var).pack(
-            anchor="w", pady=(8, 0)
-        )
-        ttk.Label(
+        clustering_hint = ttk.Label(feature_frame, textvariable=self.clustering_hint_var)
+        clustering_hint.pack(anchor="w", pady=(8, 0))
+        self._register_colored_widget(clustering_hint, "muted")
+        clustering_missing = ttk.Label(
             feature_frame,
             textvariable=self.clustering_missing_var,
-            foreground="red",
-        ).pack(anchor="w")
+        )
+        clustering_missing.pack(anchor="w")
+        self._register_colored_widget(clustering_missing, "error")
 
         downsample_frame = ttk.LabelFrame(module_tab, text="Downsampling", padding=12)
         downsample_frame.pack(fill="both", expand=False, pady=(12, 0))
@@ -2155,8 +2433,9 @@ class FlowDataApp:
                 ttk.Label(frame, text=label_text).pack(side="left")
                 entry = ttk.Entry(frame, textvariable=var, width=14)
                 entry.pack(side="left", padx=(8, 0))
-                hint = ttk.Label(frame, text="(comma separated)", foreground="#666666")
+                hint = ttk.Label(frame, text="(comma separated)")
                 hint.pack(side="left", padx=(8, 0))
+                self._register_colored_widget(hint, "muted")
                 widgets.append(entry)
             self.clustering_method_param_widgets[method_key] = widgets
 
@@ -2414,6 +2693,12 @@ class FlowDataApp:
         )
         self._make_canvas_responsive(umap_canvas, self.clustering_umap_fig, min_height=260)
         self.clustering_umap_canvas = umap_canvas
+        self._register_figure(
+            "clustering_umap",
+            self.clustering_umap_fig,
+            "clustering_umap.png",
+            self.clustering_umap_canvas,
+        )
 
         umap_frame.grid_columnconfigure(3, weight=1)
         umap_frame.grid_rowconfigure(3, weight=1)
@@ -2449,6 +2734,7 @@ class FlowDataApp:
             height=8,
         )
         self.clustering_heatmap_markers_listbox.pack(side="left", fill="both", expand=True)
+        self._register_listbox(self.clustering_heatmap_markers_listbox)
         markers_scroll = ttk.Scrollbar(
             markers_frame,
             orient="vertical",
@@ -2544,6 +2830,12 @@ class FlowDataApp:
         )
         self._make_canvas_responsive(heatmap_canvas, self.clustering_heatmap_fig, min_height=240)
         self.clustering_heatmap_canvas = heatmap_canvas
+        self._register_figure(
+            "clustering_heatmap",
+            self.clustering_heatmap_fig,
+            "clustering_heatmap.png",
+            self.clustering_heatmap_canvas,
+        )
 
         heatmap_frame.grid_columnconfigure(0, weight=1)
         heatmap_frame.grid_columnconfigure(1, weight=1)
@@ -2596,6 +2888,7 @@ class FlowDataApp:
             height=cluster_list_height,
         )
         cluster_list.pack(side="left", fill="y", expand=False)
+        self._register_listbox(cluster_list)
         cluster_scroll = ttk.Scrollbar(
             cluster_box, orient="vertical", command=cluster_list.yview
         )
@@ -2628,13 +2921,14 @@ class FlowDataApp:
             command=self._randomize_cluster_explorer_features,
         ).pack(anchor="w", pady=(12, 0))
 
-        ttk.Label(
+        explorer_status = ttk.Label(
             controls,
             textvariable=self.cluster_explorer_status_var,
             wraplength=600,
             justify="left",
-            foreground="#444444",
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        )
+        explorer_status.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self._register_colored_widget(explorer_status, "muted")
 
         style_frame = ttk.Frame(controls)
         style_frame.grid(row=0, column=3, rowspan=2, padx=(18, 0), sticky="nw")
@@ -3374,13 +3668,14 @@ class FlowDataApp:
             command=self._save_annotation_table,
         ).grid(row=1, column=2, sticky="e")
 
-        ttk.Label(
+        annotation_info = ttk.Label(
             annotation_tab,
             textvariable=self.cluster_annotation_info_var,
-            foreground="#444444",
             wraplength=750,
             justify="left",
-        ).pack(anchor="w", pady=(12, 4))
+        )
+        annotation_info.pack(anchor="w", pady=(12, 4))
+        self._register_colored_widget(annotation_info, "muted")
 
         tree_frame = ttk.Frame(annotation_tab)
         tree_frame.pack(fill="both", expand=True)
@@ -3407,11 +3702,12 @@ class FlowDataApp:
             yscroll=annotation_scroll_y.set, xscroll=annotation_scroll_x.set
         )
 
-        ttk.Label(
+        annotation_status = ttk.Label(
             annotation_tab,
             textvariable=self.cluster_annotation_status_var,
-            foreground="#666666",
-        ).pack(anchor="w", pady=(6, 0))
+        )
+        annotation_status.pack(anchor="w", pady=(6, 0))
+        self._register_colored_widget(annotation_status, "muted")
         self._refresh_annotation_method_choices()
         self._refresh_cluster_comparison_controls()
 
@@ -3459,27 +3755,29 @@ class FlowDataApp:
             command=self._generate_cluster_comparison,
         ).grid(row=1, column=2, sticky="w", padx=(12, 0))
 
-        ttk.Label(
+        comparison_hint = ttk.Label(
             controls,
             text=(
                 "Compare new clusters against existing categorical labels. Each run adds stacked composition bars, "
                 "top-class summaries, and sankey plots below."
             ),
-            foreground="#444444",
             justify="left",
             wraplength=600,
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        )
+        comparison_hint.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self._register_colored_widget(comparison_hint, "muted")
 
         results_scroll = ScrollableFrame(comparison_tab)
         results_scroll.pack(fill="both", expand=True, pady=(12, 0))
         self.cluster_compare_results_frame = ttk.Frame(results_scroll.scrollable_frame)
         self.cluster_compare_results_frame.pack(fill="both", expand=True)
 
-        ttk.Label(
+        comparison_footer = ttk.Label(
             comparison_tab,
             text="Each new comparison is appended below. Use per-chart controls to save figures or tables.",
-            foreground="#666666",
-        ).pack(anchor="w", pady=(8, 0))
+        )
+        comparison_footer.pack(anchor="w", pady=(8, 0))
+        self._register_colored_widget(comparison_footer, "muted")
 
         self._refresh_cluster_comparison_controls()
 
@@ -3904,11 +4202,12 @@ class FlowDataApp:
         )
         container.pack(fill="both", expand=True, pady=10)
 
-        ttk.Label(
+        comparison_note = ttk.Label(
             container,
             text="Stacked bars show the percent of each cluster belonging to existing categories.",
-            foreground="#444444",
-        ).pack(anchor="w")
+        )
+        comparison_note.pack(anchor="w")
+        self._register_colored_widget(comparison_note, "muted")
 
         bar_fig = self._create_cluster_comparison_bar_figure(
             percents,
@@ -3918,10 +4217,12 @@ class FlowDataApp:
         bar_canvas = FigureCanvasTkAgg(bar_fig, master=container)
         bar_canvas.get_tk_widget().pack(fill="both", expand=True, pady=(6, 0))
         self._make_canvas_responsive(bar_canvas, bar_fig)
+        bar_key = f"cluster_compare_bar_{result_index}"
+        self._register_figure(bar_key, bar_fig, f"{bar_key}.png", bar_canvas)
         ttk.Button(
             container,
             text="Save Bar Chart…",
-            command=lambda fig=bar_fig: self._save_figure(fig, f"cluster_compare_bar_{result_index}.png"),
+            command=lambda fig=bar_fig: self._save_figure(fig, f"{bar_key}.png"),
         ).pack(anchor="e", pady=(4, 8))
 
         summary_df = pd.DataFrame(
@@ -3965,10 +4266,17 @@ class FlowDataApp:
         sankey_canvas = FigureCanvasTkAgg(sankey_fig, master=container)
         sankey_canvas.get_tk_widget().pack(fill="both", expand=True, pady=(8, 0))
         self._make_canvas_responsive(sankey_canvas, sankey_fig, min_height=260)
+        sankey_key = f"cluster_compare_sankey_{result_index}"
+        self._register_figure(
+            sankey_key,
+            sankey_fig,
+            f"{sankey_key}.png",
+            sankey_canvas,
+        )
         ttk.Button(
             container,
             text="Save Sankey Plot…",
-            command=lambda fig=sankey_fig: self._save_figure(fig, f"cluster_compare_sankey_{result_index}.png"),
+            command=lambda fig=sankey_fig: self._save_figure(fig, f"{sankey_key}.png"),
         ).pack(anchor="e", pady=(4, 0))
 
         self.cluster_compare_results.append(
@@ -3995,14 +4303,14 @@ class FlowDataApp:
         fig = Figure(figsize=(width, height), dpi=100)
         ax = fig.add_subplot(111)
         bottoms = np.zeros(len(clusters))
-        palette = sns.color_palette("tab20", len(categories))
+        palette = self.color_palette or list(sns.color_palette("tab20", len(categories)))
         for idx, category in enumerate(categories):
             values = percents[category].to_numpy()
             ax.barh(
                 clusters,
                 values,
                 left=bottoms,
-                color=palette[idx],
+                color=palette[idx % len(palette)],
                 label=category,
             )
             bottoms += values
@@ -4012,6 +4320,7 @@ class FlowDataApp:
         ax.set_xlim(0, 100)
         ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
         self._finalize_figure_layout(fig)
+        self._style_figure(fig)
         return fig
 
     def _create_cluster_comparison_sankey(
@@ -4053,15 +4362,24 @@ class FlowDataApp:
         right_x = 0.9
         rect_width = 0.03
 
+        colors = self.current_theme_colors
         for cluster in clusters:
             start, end = cluster_pos[cluster]
             ax.add_patch(
-                Rectangle((left_x - rect_width, start), rect_width, end - start, color="#555555", alpha=0.5)
+                Rectangle(
+                    (left_x - rect_width, start),
+                    rect_width,
+                    end - start,
+                    color=colors.muted_text,
+                    alpha=0.45,
+                )
             )
             ax.text(left_x - rect_width - 0.01, (start + end) / 2, cluster, ha="right", va="center")
 
-        palette = sns.color_palette("tab20", len(categories))
-        category_colors = {category: palette[idx] for idx, category in enumerate(categories)}
+        palette = self.color_palette or list(sns.color_palette("tab20", len(categories)))
+        category_colors = {
+            category: palette[idx % len(palette)] for idx, category in enumerate(categories)
+        }
 
         for category in categories:
             start, end = category_pos[category]
@@ -4093,6 +4411,7 @@ class FlowDataApp:
         ax.set_ylim(0, 1)
         ax.set_title(f"Sankey: {run_label} → {category_label}")
         self._finalize_figure_layout(fig)
+        self._style_figure(fig)
         return fig
 
     def _save_cluster_compare_summary(self, dataframe: pd.DataFrame, default_filename: str) -> None:
@@ -4169,6 +4488,12 @@ class FlowDataApp:
         self._make_canvas_responsive(columns_canvas, columns_fig, min_height=240)
         self.columns_fig = columns_fig
         self.columns_canvas = columns_canvas
+        self._register_figure(
+            "training_columns",
+            self.columns_fig,
+            "columns_overview.png",
+            self.columns_canvas,
+        )
         ttk.Button(
             coverage_frame,
             text="Save Figure…",
@@ -4193,6 +4518,12 @@ class FlowDataApp:
         self._make_canvas_responsive(category_canvas, category_fig, min_height=240)
         self.category_fig = category_fig
         self.category_canvas = category_canvas
+        self._register_figure(
+            "training_category",
+            self.category_fig,
+            "target_distribution.png",
+            self.category_canvas,
+        )
         ttk.Button(
             category_frame,
             text="Save Figure…",
@@ -4218,6 +4549,12 @@ class FlowDataApp:
         self._make_canvas_responsive(viz_importance_canvas, viz_importance_fig, min_height=240)
         self.visual_importance_fig = viz_importance_fig
         self.visual_importance_canvas = viz_importance_canvas
+        self._register_figure(
+            "training_visual_importance",
+            self.visual_importance_fig,
+            "feature_importance_visuals.png",
+            self.visual_importance_canvas,
+        )
         ttk.Button(
             importance_frame,
             text="Save Figure…",
@@ -4262,10 +4599,10 @@ class FlowDataApp:
             height=12,
             wrap="word",
             state="disabled",
-            background=self.root.cget("background"),
             relief="flat",
         )
         self.metrics_text.pack(side="left", fill="both", expand=True)
+        self._register_themable_text(self.metrics_text)
 
         metrics_scroll = ttk.Scrollbar(
             text_frame, orient="vertical", command=self.metrics_text.yview
@@ -4300,6 +4637,12 @@ class FlowDataApp:
         self.confusion_canvas.get_tk_widget().pack(fill="both", expand=True)
         self._make_canvas_responsive(self.confusion_canvas, confusion_fig, min_height=260)
         self.confusion_fig = confusion_fig
+        self._register_figure(
+            "training_confusion",
+            self.confusion_fig,
+            "confusion_matrix.png",
+            self.confusion_canvas,
+        )
         ttk.Button(
             confusion_frame,
             text="Save Figure…",
@@ -4322,6 +4665,12 @@ class FlowDataApp:
         self.importance_canvas.get_tk_widget().pack(fill="both", expand=True)
         self._make_canvas_responsive(self.importance_canvas, importance_fig, min_height=240)
         self.importance_fig = importance_fig
+        self._register_figure(
+            "training_importance",
+            self.importance_fig,
+            "model_feature_importance.png",
+            self.importance_canvas,
+        )
         ttk.Button(
             importance_frame,
             text="Save Figure…",
@@ -4378,10 +4727,10 @@ class FlowDataApp:
             height=8,
             wrap="word",
             state="disabled",
-            background=self.root.cget("background"),
             relief="flat",
         )
         detail_text.pack(fill="both", expand=True)
+        self._register_themable_text(detail_text)
         self.run_detail_text = detail_text
 
         button_row = ttk.Frame(detail_frame)
@@ -4570,6 +4919,7 @@ class FlowDataApp:
         self.training_selection = []
         self.target_unique_counts.clear()
         self.target_unique_capped.clear()
+        self.training_missing_indexes.clear()
 
         if not self.data_files:
             self.training_listbox.configure(state="disabled")
@@ -4598,11 +4948,13 @@ class FlowDataApp:
             self.training_listbox.insert(tk.END, column_name)
             index = self.training_listbox.size() - 1
             if presence < total_files:
-                self.training_listbox.itemconfig(index, foreground="#B22222")
+                self.training_missing_indexes.add(index)
 
         self.training_hint_var.set(
             f"{len(self.common_columns)} columns are available across all {total_files} files."
         )
+
+        self._apply_training_missing_colors()
 
         # Default to selecting all common columns.
         self.training_listbox.selection_clear(0, tk.END)
@@ -4639,6 +4991,7 @@ class FlowDataApp:
         self.clustering_selection = []
         self.clustering_categorical_options = {}
         self.clustering_numeric_ranges = {}
+        self.clustering_missing_indexes.clear()
 
         total_rows = sum(data_file.row_count for data_file in self.data_files)
         self.clustering_total_rows_var.set(f"Total cells: {total_rows}")
@@ -4676,7 +5029,7 @@ class FlowDataApp:
             self.clustering_listbox.insert(tk.END, column_name)
             index = self.clustering_listbox.size() - 1
             if presence < total_files:
-                self.clustering_listbox.itemconfig(index, foreground="#B22222")
+                self.clustering_missing_indexes.add(index)
 
         if numeric_common:
             self.clustering_hint_var.set(
@@ -4686,6 +5039,8 @@ class FlowDataApp:
             self.clustering_hint_var.set(
                 "No numeric columns are shared across every file. Select available features carefully."
             )
+
+        self._apply_clustering_missing_colors()
 
         self.clustering_listbox.selection_clear(0, tk.END)
         for index, column_name in enumerate(self.clustering_available_columns):
@@ -5265,12 +5620,15 @@ class FlowDataApp:
 
         categories = list(self.target_counts_total.keys())
         counts = [self.target_counts_total[category] for category in categories]
-        self.category_ax.bar(categories, counts, color="#55A868")
+        palette = self.color_palette or ["#55A868"]
+        bar_colors = [palette[idx % len(palette)] for idx in range(len(categories))]
+        self.category_ax.bar(categories, counts, color=bar_colors)
         self.category_ax.set_ylabel("Rows")
         self.category_ax.set_xlabel("Category")
         self.category_ax.set_title(f"{self.target_column_var.get()} distribution")
         self.category_ax.tick_params(axis="x", labelrotation=35)
         self._finalize_figure_layout(self.category_fig, bottom=0.32)
+        self._style_figure(self.category_fig)
         self.category_canvas.draw_idle()
 
     def _clear_category_tables(self) -> None:
@@ -5804,7 +6162,7 @@ class FlowDataApp:
         width = base_width + (2.0 if marker_dendro else 0.0)
         height = base_height + (2.0 if cluster_dendro else 0.0)
         linewidth = 0.2
-        linecolor = "#333333"
+        linecolor = self.current_theme_colors.axes_edge
         self.clustering_heatmap_colorbar = None
 
         if cluster_dendro or marker_dendro:
@@ -5815,7 +6173,7 @@ class FlowDataApp:
                 )
                 g = sns.clustermap(
                     data,
-                    cmap="viridis",
+                    cmap=self.sequential_cmap,
                     row_cluster=cluster_dendro,
                     col_cluster=marker_dendro,
                     method="average",
@@ -5835,6 +6193,7 @@ class FlowDataApp:
                 g.ax_heatmap.set_xlabel("Marker")
                 g.ax_heatmap.set_ylabel("Cluster")
                 g.ax_heatmap.tick_params(axis="x", rotation=45)
+                self._style_figure(g.fig)
                 self._update_heatmap_canvas(g.fig)
                 self.clustering_heatmap_ax = g.ax_heatmap
                 if g.ax_heatmap.collections:
@@ -5853,7 +6212,7 @@ class FlowDataApp:
         heatmap = sns.heatmap(
             data,
             ax=ax,
-            cmap="viridis",
+            cmap=self.sequential_cmap,
             cbar=True,
             linewidths=linewidth,
             linecolor=linecolor,
@@ -5868,6 +6227,7 @@ class FlowDataApp:
         if self.clustering_heatmap_colorbar is not None:
             self.clustering_heatmap_colorbar.set_label("Expression")
         self._finalize_figure_layout(figure, bottom=0.32)
+        self._style_figure(figure)
         self._update_heatmap_canvas(figure)
         self.clustering_heatmap_ax = ax
         self.clustering_heatmap_canvas.draw_idle()
@@ -6438,6 +6798,12 @@ class FlowDataApp:
         )
         self._make_canvas_responsive(self.clustering_heatmap_canvas, figure, min_height=240)
         self.clustering_heatmap_fig = figure
+        self._register_figure(
+            "clustering_heatmap",
+            self.clustering_heatmap_fig,
+            "clustering_heatmap.png",
+            self.clustering_heatmap_canvas,
+        )
 
     @staticmethod
     def _normalize_filter_value(value: object) -> object:
@@ -7937,7 +8303,7 @@ class FlowDataApp:
         sns.heatmap(
             conf_matrix,
             annot=False,
-            cmap="Blues",
+            cmap=self.sequential_cmap,
             xticklabels=class_labels,
             yticklabels=class_labels,
             ax=self.confusion_ax,
@@ -7951,6 +8317,7 @@ class FlowDataApp:
         if colorbar is not None:
             colorbar.ax.tick_params(labelsize=8)
         self._finalize_figure_layout(self.confusion_fig)
+        self._style_figure(self.confusion_fig)
         self.confusion_canvas.draw_idle()
 
     def _update_importance_plot(self, payload: Dict[str, object]) -> None:
@@ -7981,23 +8348,27 @@ class FlowDataApp:
         top_features_arr = list(top_features)
         top_values_arr = np.array(top_values)
 
+        palette = self.color_palette or ["#dd8452"]
+        bar_color = palette[0]
         self.importance_ax.barh(
-            top_features_arr[::-1], top_values_arr[::-1], color="#dd8452"
+            top_features_arr[::-1], top_values_arr[::-1], color=bar_color
         )
         self.importance_ax.set_xlabel("Importance")
         self.importance_ax.set_ylabel("Feature")
         self.importance_ax.set_title("Top feature importances")
         self._finalize_figure_layout(self.importance_fig)
+        self._style_figure(self.importance_fig)
         self.importance_canvas.draw_idle()
 
         if hasattr(self, "visual_importance_ax"):
             self.visual_importance_ax.barh(
-                top_features_arr[::-1], top_values_arr[::-1], color="#dd8452"
+                top_features_arr[::-1], top_values_arr[::-1], color=bar_color
             )
             self.visual_importance_ax.set_xlabel("Importance")
             self.visual_importance_ax.set_ylabel("Feature")
             self.visual_importance_ax.set_title("Top feature importances")
             self._finalize_figure_layout(self.visual_importance_fig)
+            self._style_figure(self.visual_importance_fig)
             self.visual_importance_canvas.draw_idle()
 
     def save_model(self) -> None:
@@ -8511,12 +8882,15 @@ class FlowDataApp:
         columns = list(self.column_presence.keys())
         counts = [self.column_presence[column] for column in columns]
 
-        self.columns_ax.barh(columns, counts, color="#4C72B0")
+        palette = self.color_palette or ["#4C72B0"]
+        bar_colors = [palette[idx % len(palette)] for idx in range(len(columns))]
+        self.columns_ax.barh(columns, counts, color=bar_colors)
         self.columns_ax.set_xlabel("Number of files containing column")
         self.columns_ax.set_ylabel("Column")
         self.columns_ax.invert_yaxis()
         self.columns_ax.set_title("Column coverage across loaded files")
         self._finalize_figure_layout(self.columns_fig, left=0.22)
+        self._style_figure(self.columns_fig)
         self.columns_canvas.draw_idle()
 
     @classmethod
