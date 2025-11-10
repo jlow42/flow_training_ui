@@ -358,6 +358,10 @@ class FlowDataApp:
         self.run_registry_path = self.cache_dir / "run_registry.json"
         self.run_registry: List[Dict[str, object]] = []
         self._pending_training_restore: Optional[Dict[str, object]] = None
+        self.training_dataset_signature: Optional[str] = None
+        self.training_dataset_format: str = "parquet"
+        self._cached_training_dataset_path: Optional[Path] = None
+        self._restoring_training_state = False
         self.quality_tree: Optional[ttk.Treeview] = None
         self.quality_summary_text: Optional[tk.Text] = None
         self.run_registry_tree: Optional[ttk.Treeview] = None
@@ -5058,6 +5062,7 @@ class FlowDataApp:
         return "break"
 
     def _on_training_selection_changed(self) -> None:
+        self._invalidate_training_cache()
         if not self.data_files:
             self.training_missing_var.set("")
             self._mark_session_dirty()
@@ -5158,6 +5163,7 @@ class FlowDataApp:
         if not self.data_files:
             return
 
+        self._invalidate_training_cache()
         target_column = self.target_column_var.get()
         if not target_column:
             self._clear_category_tables()
@@ -6688,7 +6694,12 @@ class FlowDataApp:
         cache_path = self.data_engine.ensure_cached_dataset(
             signature=signature,
             columns=required_columns,
+            extra={"mode": "training"},
         )
+        self.training_dataset_signature = signature
+        self.training_dataset_format = "parquet"
+        self._cached_training_dataset_path = cache_path
+        self._mark_session_dirty()
         return pd.read_parquet(cache_path)
 
     @staticmethod
@@ -6747,6 +6758,7 @@ class FlowDataApp:
         self.training_results = {}
         self.training_in_progress = False
         self._reset_results_view()
+        self._invalidate_training_cache()
 
     def _clear_clustering_state(self) -> None:
         self.clustering_results = {}
@@ -8428,26 +8440,53 @@ class FlowDataApp:
         if not state:
             return
         self._pending_training_restore = None
-        features = state.get("features", [])
-        if features and hasattr(self, "training_listbox"):
-            self.training_listbox.selection_clear(0, tk.END)
-            available_map = {name: idx for idx, name in enumerate(self.available_training_columns)}
-            for feature in features:
-                idx = available_map.get(feature)
-                if idx is not None:
-                    self.training_listbox.selection_set(idx)
-            self._on_training_selection_changed()
-        target = state.get("target")
-        if target and target in (self.target_combo["values"] or []):
-            self.target_column_var.set(target)
-            self.on_target_column_selected()
-        balance = state.get("class_balance")
-        if balance:
-            self.class_balance_var.set(balance)
-        model = state.get("model")
-        if model and model in self.training_model_configs:
-            self.training_model_var.set(model)
-            self._on_training_model_changed()
+        self._invalidate_training_cache()
+        self._restoring_training_state = True
+        try:
+            features = state.get("features", [])
+            if features and hasattr(self, "training_listbox"):
+                self.training_listbox.selection_clear(0, tk.END)
+                available_map = {
+                    name: idx for idx, name in enumerate(self.available_training_columns)
+                }
+                for feature in features:
+                    idx = available_map.get(feature)
+                    if idx is not None:
+                        self.training_listbox.selection_set(idx)
+                self._on_training_selection_changed()
+            target = state.get("target")
+            if target and target in (self.target_combo["values"] or []):
+                self.target_column_var.set(target)
+                self.on_target_column_selected()
+            balance = state.get("class_balance")
+            if balance:
+                self.class_balance_var.set(balance)
+            model = state.get("model")
+            if model and model in self.training_model_configs:
+                self.training_model_var.set(model)
+                self._on_training_model_changed()
+
+            signature = state.get("dataset_signature")
+            dataset_format = state.get("dataset_format", "parquet")
+            if (
+                signature
+                and features
+                and target
+                and self.data_files
+            ):
+                required_columns = list(dict.fromkeys(features + [target]))
+                cached = self.data_engine.lookup_cached_dataset(
+                    signature=signature,
+                    columns=required_columns,
+                    extra={"mode": "training"},
+                    storage_format=dataset_format,
+                )
+                if cached is not None:
+                    self.training_dataset_signature = signature
+                    self.training_dataset_format = dataset_format
+                    self._cached_training_dataset_path = cached
+        finally:
+            self._restoring_training_state = False
         self._mark_session_dirty()
 
     def _mark_session_dirty(self) -> None:
@@ -8470,12 +8509,26 @@ class FlowDataApp:
                 "class_balance": self.class_balance_var.get(),
             },
         }
+        if self.training_dataset_signature:
+            state["training"].update(
+                {
+                    "dataset_signature": self.training_dataset_signature,
+                    "dataset_format": self.training_dataset_format,
+                }
+            )
         try:
             with self.session_path.open("w", encoding="utf-8") as handle:
                 json.dump(state, handle, indent=2)
         except Exception:
             pass
         self.session_dirty = False
+
+    def _invalidate_training_cache(self) -> None:
+        if self._restoring_training_state:
+            return
+        self.training_dataset_signature = None
+        self.training_dataset_format = "parquet"
+        self._cached_training_dataset_path = None
 
     def _recompute_column_numeric_hints(self) -> None:
         hints: Dict[str, bool] = {}
