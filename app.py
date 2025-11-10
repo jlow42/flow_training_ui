@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -34,6 +34,14 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from clustering_ops import (
+    IncrementalUpdateResult,
+    incremental_update_assignments,
+    merge_clusters,
+    prepare_imported_assignments,
+    scale_feature_matrix,
+    split_cluster,
+)
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -714,6 +722,9 @@ class FlowDataApp:
         self.clustering_features_used: List[str] = []
         self.clustering_dataset_cache: Optional[pd.DataFrame] = None
         self.clustering_feature_matrix: Optional[np.ndarray] = None
+        self.clustering_incremental_state: Dict[str, Dict[str, object]] = {}
+        self.clustering_incremental_scaler: Optional[Dict[str, Sequence[float]]] = None
+        self.clustering_incremental_var = tk.BooleanVar(value=False)
         self.base_clustering_method_labels = {
             key: cfg["label"] for key, cfg in self.clustering_methods.items()
         }
@@ -746,6 +757,16 @@ class FlowDataApp:
         self.pending_clustering_labels: Dict[str, str] = {}
         self.cluster_annotation_method_var = tk.StringVar()
         self.cluster_annotations: Dict[str, pd.DataFrame] = {}
+        self.manual_cluster_run_var = tk.StringVar()
+        self.manual_merge_label_var = tk.StringVar()
+        self.manual_split_prefix_var = tk.StringVar(value="split_")
+        self.manual_split_count_var = tk.IntVar(value=2)
+        self.manual_cluster_status_var = tk.StringVar(
+            value="Select a clustering run to edit clusters."
+        )
+        self.manual_cluster_listbox: Optional[tk.Listbox] = None
+        self.manual_cluster_run_choices: Dict[str, str] = {}
+        self.manual_cluster_run_combo: Optional[ttk.Combobox] = None
         self.cluster_annotation_recent_terms: Dict[str, Set[str]] = defaultdict(set)
         self.current_annotation_run_key: Optional[str] = None
         self.cluster_annotation_info_var = tk.StringVar(
@@ -2177,6 +2198,12 @@ class FlowDataApp:
         )
         self.clustering_n_jobs_spin.pack(side="left", padx=(6, 18))
 
+        ttk.Checkbutton(
+            action_frame,
+            text="Incremental update",
+            variable=self.clustering_incremental_var,
+        ).pack(side="left", padx=(0, 18))
+
         self.run_clustering_button = ttk.Button(
             action_frame, text="Run Clustering", command=self.start_clustering
         )
@@ -2197,6 +2224,11 @@ class FlowDataApp:
             action_frame,
             text="Save Clustering Output…",
             command=self.save_clustering_output,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Button(
+            action_frame,
+            text="Load Assignments…",
+            command=self.load_clustering_assignments,
         ).pack(side="left", padx=(12, 0))
 
     def _init_clustering_results_tab(self, notebook: ttk.Notebook) -> None:
@@ -2242,6 +2274,363 @@ class FlowDataApp:
         self.clustering_clusters_tree.column("cluster", anchor="center", width=120)
         self.clustering_clusters_tree.column("count", anchor="center", width=100)
         self.clustering_clusters_tree.pack(fill="both", expand=True, pady=(4, 0))
+
+        manual_frame = ttk.LabelFrame(
+            results_tab, text="Manual cluster operations", padding=12
+        )
+        manual_frame.pack(fill="x", pady=(12, 0))
+
+        run_combo = ttk.Combobox(
+            manual_frame,
+            textvariable=self.manual_cluster_run_var,
+            state="readonly",
+        )
+        run_combo.pack(fill="x")
+        run_combo.bind("<<ComboboxSelected>>", self._on_manual_cluster_run_changed)
+        self.manual_cluster_run_combo = run_combo
+
+        list_frame = ttk.Frame(manual_frame)
+        list_frame.pack(fill="x", pady=(8, 0))
+        cluster_list = tk.Listbox(
+            list_frame,
+            selectmode="extended",
+            height=6,
+        )
+        cluster_list.pack(side="left", fill="both", expand=True)
+        scroll_bar = ttk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=cluster_list.yview,
+        )
+        scroll_bar.pack(side="right", fill="y")
+        cluster_list.configure(yscrollcommand=scroll_bar.set)
+        cluster_list.bind("<Control-Button-1>", self._toggle_cluster_explorer_selection)
+        cluster_list.bind("<Command-Button-1>", self._toggle_cluster_explorer_selection)
+        cluster_list.bind("<<ListboxSelect>>", self._on_manual_cluster_selection_changed)
+        self.manual_cluster_listbox = cluster_list
+
+        merge_frame = ttk.Frame(manual_frame)
+        merge_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(merge_frame, text="Merge selected clusters into").pack(side="left")
+        ttk.Entry(merge_frame, textvariable=self.manual_merge_label_var, width=18).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(
+            merge_frame,
+            text="Merge",
+            command=self._merge_selected_clusters,
+        ).pack(side="left", padx=(12, 0))
+
+        split_frame = ttk.Frame(manual_frame)
+        split_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(split_frame, text="Split selected cluster into").pack(side="left")
+        ttk.Spinbox(
+            split_frame,
+            from_=2,
+            to=20,
+            textvariable=self.manual_split_count_var,
+            width=5,
+        ).pack(side="left", padx=(6, 6))
+        ttk.Label(split_frame, text="parts with prefix").pack(side="left")
+        ttk.Entry(split_frame, textvariable=self.manual_split_prefix_var, width=14).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(
+            split_frame,
+            text="Split",
+            command=self._split_selected_cluster,
+        ).pack(side="left", padx=(12, 0))
+
+        ttk.Label(
+            manual_frame,
+            textvariable=self.manual_cluster_status_var,
+            foreground="#555555",
+            wraplength=640,
+            justify="left",
+        ).pack(fill="x", pady=(10, 0))
+
+        self._refresh_manual_cluster_controls()
+
+    def _refresh_manual_cluster_controls(self) -> None:
+        if self.manual_cluster_run_combo is None:
+            return
+        run_labels: List[str] = []
+        run_map: Dict[str, str] = {}
+        for run_key in self.clustering_results.keys():
+            label = self.clustering_method_labels.get(run_key, run_key)
+            run_labels.append(label)
+            run_map[label] = run_key
+        run_labels.sort(key=str.lower)
+        self.manual_cluster_run_choices = run_map
+        self.manual_cluster_run_combo["values"] = run_labels
+        current = self.manual_cluster_run_var.get()
+        if current not in run_labels:
+            if run_labels:
+                self.manual_cluster_run_var.set(run_labels[0])
+            else:
+                self.manual_cluster_run_var.set("")
+        self._populate_manual_cluster_list()
+
+    def _populate_manual_cluster_list(self) -> None:
+        if self.manual_cluster_listbox is None:
+            return
+        self.manual_cluster_listbox.delete(0, tk.END)
+        run_key = self._get_manual_run_key()
+        if not run_key or run_key not in self.clustering_results:
+            return
+        dataset = self.clustering_results[run_key]
+        clusters = [str(value) for value in sorted(pd.unique(dataset["cluster"]))]
+        for cluster_value in clusters:
+            self.manual_cluster_listbox.insert(tk.END, cluster_value)
+
+    def _get_manual_run_key(self) -> Optional[str]:
+        label = self.manual_cluster_run_var.get()
+        if not label:
+            return None
+        return self.manual_cluster_run_choices.get(label, label)
+
+    def _on_manual_cluster_run_changed(self, _event: Optional[tk.Event] = None) -> None:
+        self._populate_manual_cluster_list()
+        self.manual_cluster_status_var.set(
+            "Select clusters to merge or split for the chosen run."
+        )
+
+    def _on_manual_cluster_selection_changed(
+        self, _event: Optional[tk.Event] = None
+    ) -> None:
+        if self.manual_cluster_listbox is None:
+            return
+        selections = self.manual_cluster_listbox.curselection()
+        if not selections:
+            self.manual_cluster_status_var.set(
+                "Select clusters to merge or split for the chosen run."
+            )
+            return
+        labels = [self.manual_cluster_listbox.get(idx) for idx in selections]
+        self.manual_cluster_status_var.set(
+            f"Selected clusters: {', '.join(labels)}"
+        )
+
+    def _merge_selected_clusters(self) -> None:
+        run_key = self._get_manual_run_key()
+        if not run_key or run_key not in self.clustering_results:
+            messagebox.showerror("No run", "Select a clustering run before merging clusters.")
+            return
+        if self.manual_cluster_listbox is None:
+            return
+        selections = self.manual_cluster_listbox.curselection()
+        if len(selections) < 2:
+            messagebox.showerror(
+                "Select clusters", "Select at least two clusters to merge."
+            )
+            return
+        clusters = [self.manual_cluster_listbox.get(idx) for idx in selections]
+        new_label = self.manual_merge_label_var.get().strip() or clusters[0]
+        try:
+            updated_df = merge_clusters(self.clustering_results[run_key], clusters, new_label)
+        except ValueError as exc:
+            messagebox.showerror("Merge error", str(exc))
+            return
+        self.clustering_results[run_key] = updated_df
+        self.manual_cluster_status_var.set(
+            f"Merged clusters {', '.join(clusters)} into '{new_label}'."
+        )
+        self.manual_merge_label_var.set("")
+        self._after_manual_cluster_update(run_key)
+
+    def _split_selected_cluster(self) -> None:
+        run_key = self._get_manual_run_key()
+        if not run_key or run_key not in self.clustering_results:
+            messagebox.showerror("No run", "Select a clustering run before splitting clusters.")
+            return
+        if self.manual_cluster_listbox is None:
+            return
+        selections = self.manual_cluster_listbox.curselection()
+        if len(selections) != 1:
+            messagebox.showerror(
+                "Select cluster", "Select exactly one cluster to split."
+            )
+            return
+        cluster_value = self.manual_cluster_listbox.get(selections[0])
+        prefix = self.manual_split_prefix_var.get().strip() or f"{cluster_value}_"
+        try:
+            split_count = max(2, int(self.manual_split_count_var.get()))
+        except (TypeError, ValueError):
+            messagebox.showerror("Invalid split", "Enter a valid number of splits (>=2).")
+            return
+        scaler_params = self.clustering_incremental_scaler
+        try:
+            updated_df, scaled_matrix = split_cluster(
+                self.clustering_results[run_key],
+                self.clustering_features_used,
+                scaler_params,
+                cluster_value,
+                split_count,
+                prefix,
+                RANDOM_STATE,
+            )
+        except ValueError as exc:
+            messagebox.showerror("Split error", str(exc))
+            return
+        self.clustering_results[run_key] = updated_df
+        if scaler_params:
+            self.clustering_feature_matrix = scale_feature_matrix(
+                self.clustering_dataset_cache or updated_df,
+                self.clustering_features_used,
+                scaler_params["mean"],
+                scaler_params["scale"],
+            )
+        else:
+            self.clustering_feature_matrix = scaled_matrix
+        self.manual_cluster_status_var.set(
+            f"Split cluster '{cluster_value}' into {split_count} parts with prefix '{prefix}'."
+        )
+        self._after_manual_cluster_update(run_key)
+
+    def _after_manual_cluster_update(self, run_key: str) -> None:
+        self._recompute_cluster_metadata(run_key)
+        self._refresh_clustering_result_tables_from_state()
+        self._refresh_manual_cluster_controls()
+        self._update_clustering_visual_controls()
+        self.clustering_umap_cache.clear()
+
+    def _recompute_cluster_metadata(self, run_key: str) -> None:
+        if run_key not in self.clustering_results:
+            return
+        dataset = self.clustering_results[run_key]
+        counts = (
+            dataset["cluster"].value_counts(dropna=False).sort_index().to_dict()
+        )
+        metadata_entry = dict(self.clustering_metadata.get(run_key, {}))
+        metadata_entry.update(
+            {
+                "cluster_sizes": {str(k): int(v) for k, v in counts.items()},
+                "cluster_count": len(counts),
+                "rows_used": int(dataset.shape[0]),
+            }
+        )
+        self.clustering_metadata[run_key] = metadata_entry
+        centroids_available = False
+        if self.clustering_incremental_scaler:
+            try:
+                feature_matrix = scale_feature_matrix(
+                    dataset,
+                    self.clustering_features_used,
+                    self.clustering_incremental_scaler["mean"],
+                    self.clustering_incremental_scaler["scale"],
+                )
+                centroids: Dict[str, List[float]] = {}
+                clusters = dataset["cluster"].to_numpy()
+                for cluster_value in pd.unique(clusters):
+                    mask = clusters == cluster_value
+                    if not np.any(mask):
+                        continue
+                    centroids[str(cluster_value)] = feature_matrix[mask].mean(axis=0).tolist()
+                state_entry = dict(self.clustering_incremental_state.get(run_key, {}))
+                state_entry.update(
+                    {
+                        "supports_incremental": bool(
+                            state_entry.get("supports_incremental", False)
+                        ),
+                        "cluster_sizes": metadata_entry["cluster_sizes"],
+                        "rows": int(dataset.shape[0]),
+                        "centroids_scaled": centroids,
+                    }
+                )
+                self.clustering_incremental_state[run_key] = state_entry
+                centroids_available = True
+            except Exception:
+                centroids_available = False
+        if not centroids_available and run_key in self.clustering_incremental_state:
+            self.clustering_incremental_state.pop(run_key, None)
+
+    def _refresh_clustering_result_tables_from_state(self) -> None:
+        if hasattr(self, "clustering_summary_tree"):
+            self.clustering_summary_tree.delete(
+                *self.clustering_summary_tree.get_children()
+            )
+            for run_key, dataset in self.clustering_results.items():
+                label = self.clustering_method_labels.get(run_key, run_key)
+                counts = dataset["cluster"].nunique(dropna=False)
+                self.clustering_summary_tree.insert(
+                    "",
+                    "end",
+                    iid=run_key,
+                    values=(label, counts, dataset.shape[0]),
+                )
+        if hasattr(self, "clustering_clusters_tree"):
+            self.clustering_clusters_tree.delete(
+                *self.clustering_clusters_tree.get_children()
+            )
+            for run_key, dataset in self.clustering_results.items():
+                label = self.clustering_method_labels.get(run_key, run_key)
+                counts = (
+                    dataset["cluster"].value_counts(dropna=False).sort_index().to_dict()
+                )
+                for cluster_value, cluster_size in counts.items():
+                    self.clustering_clusters_tree.insert(
+                        "",
+                        "end",
+                        values=(label, str(cluster_value), int(cluster_size)),
+                    )
+
+    def _incremental_clustering_update(
+        self,
+        dataset: pd.DataFrame,
+        base_metadata: Dict[str, object],
+        selected_methods: List[
+            tuple[str, str, Dict[str, object], Dict[str, object], str]
+        ],
+    ) -> Dict[str, object]:
+        if not self.clustering_results:
+            raise ValueError("Run clustering before requesting an incremental update.")
+        previous_dataset = self.clustering_dataset_cache
+        if previous_dataset is None or previous_dataset.empty:
+            raise ValueError("Previous clustering dataset is unavailable for incremental updates.")
+        if not self.clustering_incremental_scaler:
+            raise ValueError(
+                "Incremental updates require prior clustering results with stored scaler parameters."
+            )
+        existing_run_keys = set(self.clustering_results.keys())
+        requested_run_keys = {run_key for run_key, *_ in selected_methods}
+        if requested_run_keys != existing_run_keys:
+            raise ValueError(
+                "Incremental clustering requires selecting the same method configurations as the previous run."
+            )
+
+        update_result: IncrementalUpdateResult = incremental_update_assignments(
+            assignments=self.clustering_results,
+            metadata=self.clustering_metadata,
+            incremental_state=self.clustering_incremental_state,
+            scaler_params=self.clustering_incremental_scaler,
+            previous_dataset=previous_dataset,
+            new_dataset=dataset,
+            features=self.clustering_features_used,
+            method_labels=self.clustering_method_labels,
+        )
+
+        self.clustering_dataset_cache = dataset.copy()
+        self.clustering_feature_matrix = update_result.feature_matrix
+        self.clustering_incremental_state = update_result.incremental_state
+        base_metadata = dict(base_metadata)
+        base_metadata["rows_after_downsampling"] = int(dataset.shape[0])
+        base_metadata["rows_used"] = int(dataset.shape[0])
+        subset_meta = base_metadata.get("subset")
+        if isinstance(subset_meta, dict):
+            subset_meta["rows_after_filters"] = int(dataset.shape[0])
+
+        return {
+            "summary": update_result.summary,
+            "clusters": update_result.clusters,
+            "assignments": update_result.assignments,
+            "metadata": update_result.metadata,
+            "base_metadata": base_metadata,
+            "labels": self.clustering_method_labels,
+            "errors": [],
+            "features": list(self.clustering_features_used),
+            "incremental_state": update_result.incremental_state,
+            "scaler_params": self.clustering_incremental_scaler,
+        }
 
         clusters_scroll = ttk.Scrollbar(
             clusters_frame,
@@ -5886,6 +6275,8 @@ class FlowDataApp:
         ],
         n_jobs: int,
         base_metadata: Dict[str, object],
+        scaler: StandardScaler,
+        feature_names: List[str],
     ) -> None:
         try:
             base_metadata = dict(base_metadata)
@@ -5895,6 +6286,9 @@ class FlowDataApp:
             errors: List[str] = []
             metadata: Dict[str, Dict[str, object]] = {}
             label_map: Dict[str, str] = {}
+            incremental_state: Dict[str, Dict[str, object]] = {}
+
+            feature_matrix = dataset[feature_names].to_numpy(dtype=float, copy=False)
 
             max_workers = max(1, min(len(selected_methods), n_jobs))
 
@@ -5942,6 +6336,16 @@ class FlowDataApp:
                     str(cluster_value): int(cluster_size)
                     for cluster_value, cluster_size in counts.items()
                 }
+                centroids_scaled: Dict[str, List[float]] = {}
+                centroids_raw: Dict[str, List[float]] = {}
+                supports_incremental = method_key == "kmeans"
+                if supports_incremental:
+                    for cluster_value in counts.keys():
+                        mask = labels_array == cluster_value
+                        if not np.any(mask):
+                            continue
+                        centroids_scaled[str(cluster_value)] = features_scaled[mask].mean(axis=0).tolist()
+                        centroids_raw[str(cluster_value)] = feature_matrix[mask].mean(axis=0).tolist()
                 meta_entry = {
                     "run_key": run_key,
                     "method_key": method_key,
@@ -5953,7 +6357,13 @@ class FlowDataApp:
                     "cluster_sizes": cluster_sizes,
                 }
                 meta_entry["params"] = self._to_serializable(meta_entry["params"])
-                return summary_entry, cluster_entries, assignment_df, meta_entry
+                incremental_entry = {
+                    "supports_incremental": supports_incremental,
+                    "cluster_sizes": cluster_sizes,
+                    "centroids_scaled": centroids_scaled,
+                    "centroids_raw": centroids_raw,
+                }
+                return summary_entry, cluster_entries, assignment_df, meta_entry, incremental_entry
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
@@ -5969,6 +6379,7 @@ class FlowDataApp:
                             cluster_entries,
                             assignment_df,
                             meta_entry,
+                            incremental_entry,
                         ) = future.result()
                         results_summary.append(summary_entry)
                         cluster_breakdown.extend(cluster_entries)
@@ -5977,6 +6388,7 @@ class FlowDataApp:
                         metadata_entry.update(meta_entry)
                         metadata[run_key] = self._to_serializable(metadata_entry)
                         label_map[run_key] = run_label
+                        incremental_state[run_key] = self._to_serializable(incremental_entry)
                     except ImportError as exc:
                         errors.append(f"{label}: missing dependency ({exc}).")
                         params_serializable = self._to_serializable(params)
@@ -6011,10 +6423,15 @@ class FlowDataApp:
                 "clusters": cluster_breakdown,
                 "assignments": assignments,
                 "errors": errors,
-                "features": list(self.clustering_selection),
+                "features": list(feature_names),
                 "metadata": metadata,
                 "base_metadata": self._to_serializable(base_metadata),
                 "labels": label_map,
+                "incremental_state": incremental_state,
+                "scaler_params": {
+                    "mean": scaler.mean_.tolist(),
+                    "scale": scaler.scale_.tolist(),
+                },
             }
             self.clustering_queue.put({"status": "success", "payload": payload})
         except Exception as exc:  # noqa: BLE001
@@ -6223,7 +6640,22 @@ class FlowDataApp:
             self.clustering_method_labels = dict(self.base_clustering_method_labels)
         self.pending_clustering_labels = {}
 
+        incremental_state = payload.get("incremental_state")
+        if isinstance(incremental_state, dict):
+            self.clustering_incremental_state = {
+                str(key): dict(value) if isinstance(value, dict) else {}
+                for key, value in incremental_state.items()
+            }
+        else:
+            self.clustering_incremental_state = {}
+        scaler_params = payload.get("scaler_params")
+        if isinstance(scaler_params, dict):
+            self.clustering_incremental_scaler = scaler_params
+        else:
+            self.clustering_incremental_scaler = None
+
         self._update_clustering_visual_controls()
+        self._refresh_manual_cluster_controls()
 
         if errors:
             messagebox.showwarning(
@@ -6258,6 +6690,8 @@ class FlowDataApp:
         export_df = base_df.copy()
         added_column = False
         annotation_added = False
+        column_map: Dict[str, str] = {}
+        annotation_meta: Dict[str, List[Dict[str, str]]] = {}
         for method_key, result_df in self.clustering_results.items():
             if result_df.empty or "cluster" not in result_df.columns:
                 continue
@@ -6272,6 +6706,7 @@ class FlowDataApp:
                 continue
             export_df[col_name] = result_df["cluster"].values
             added_column = True
+            column_map[method_key] = col_name
 
             annotation_df = self.cluster_annotations.get(method_key)
             if annotation_df is not None and not annotation_df.empty:
@@ -6295,6 +6730,10 @@ class FlowDataApp:
                             continue
                         export_df[export_column] = values.fillna("")
                         annotation_added = True
+                        annotation_entries = annotation_meta.setdefault(method_key, [])
+                        annotation_entries.append(
+                            {"name": annotation_column, "column": export_column}
+                        )
 
         if annotation_added:
             self.cluster_annotation_status_var.set(
@@ -6333,10 +6772,26 @@ class FlowDataApp:
             base_meta["features"] = list(self.clustering_features_used)
         if "files" not in base_meta:
             base_meta["files"] = [str(data_file.path) for data_file in self.data_files]
+        methods_meta: Dict[str, Dict[str, object]] = {}
+        for method_key, meta in self.clustering_metadata.items():
+            entry = dict(meta)
+            if method_key in column_map:
+                entry["column_name"] = column_map[method_key]
+            if method_key in annotation_meta:
+                entry["annotation_columns"] = annotation_meta[method_key]
+            state_entry = self.clustering_incremental_state.get(method_key)
+            if state_entry:
+                entry["supports_incremental"] = bool(
+                    state_entry.get("supports_incremental", False)
+                )
+            methods_meta[method_key] = entry
+
         metadata_export = {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "base": base_meta,
-            "methods": self.clustering_metadata,
+            "methods": methods_meta,
+            "incremental_state": self.clustering_incremental_state,
+            "scaler_params": self.clustering_incremental_scaler,
         }
         metadata_export = self._to_serializable(metadata_export)
         metadata_path = Path(file_path).with_name(
@@ -6360,6 +6815,81 @@ class FlowDataApp:
             )
         else:
             messagebox.showinfo("Saved", f"Clustering output saved to {file_path}")
+
+    def load_clustering_assignments(self) -> None:
+        file_path = filedialog.askopenfilename(
+            title="Load clustering assignments",
+            filetypes=[
+                ("CSV file", "*.csv"),
+                ("Parquet file", "*.parquet"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+        try:
+            if file_path.lower().endswith(".parquet"):
+                import_df = pd.read_parquet(file_path)
+            else:
+                import_df = pd.read_csv(file_path)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Load error", f"Failed to read clustering file: {exc}")
+            return
+
+        metadata_path = Path(file_path).with_name(Path(file_path).stem + "_metadata.json")
+        if not metadata_path.exists():
+            metadata_file = filedialog.askopenfilename(
+                title="Select clustering metadata",
+                filetypes=[("JSON file", "*.json"), ("All files", "*.*")],
+            )
+            if not metadata_file:
+                messagebox.showerror(
+                    "Metadata required", "Select the metadata JSON exported with the clustering file."
+                )
+                return
+            metadata_path = Path(metadata_file)
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Metadata error", f"Failed to read metadata file: {exc}")
+            return
+
+        try:
+            (
+                assignments,
+                metadata_map,
+                method_labels,
+                incremental_state,
+                annotations,
+                features,
+                base_df,
+                scaler_params,
+                feature_matrix,
+            ) = prepare_imported_assignments(import_df, metadata)
+        except ValueError as exc:
+            messagebox.showerror("Import error", str(exc))
+            return
+
+        self.clustering_results = assignments
+        self.clustering_metadata = metadata_map
+        self.clustering_method_labels = method_labels
+        self.clustering_incremental_state = incremental_state
+        self.cluster_annotations = annotations
+        self.clustering_features_used = features
+        self.clustering_dataset_cache = base_df
+        self.clustering_feature_matrix = feature_matrix
+        self.clustering_incremental_scaler = scaler_params
+        base_meta = metadata.get("base")
+        if isinstance(base_meta, dict):
+            self.clustering_run_metadata_base = base_meta
+        else:
+            self.clustering_run_metadata_base = {}
+        self.clustering_umap_cache.clear()
+        self.clustering_status_var.set("Clustering assignments loaded from file.")
+        self._refresh_clustering_result_tables_from_state()
+        self._update_clustering_visual_controls()
+        self._refresh_manual_cluster_controls()
+        messagebox.showinfo("Import complete", "Clustering assignments loaded successfully.")
 
     def _save_figure(self, figure: Optional[Figure], default_filename: str) -> None:
         if figure is None:
@@ -6755,6 +7285,8 @@ class FlowDataApp:
         self.clustering_features_used = []
         self.clustering_dataset_cache = None
         self.clustering_feature_matrix = None
+        self.clustering_incremental_state = {}
+        self.clustering_incremental_scaler = None
         self.clustering_umap_cache.clear()
         self.clustering_metadata = {}
         self.clustering_run_metadata_base = {}
@@ -6786,6 +7318,14 @@ class FlowDataApp:
             self.clustering_clusters_tree.delete(
                 *self.clustering_clusters_tree.get_children()
             )
+        self.manual_cluster_run_choices = {}
+        self.manual_cluster_run_var.set("")
+        self.manual_merge_label_var.set("")
+        self.manual_cluster_status_var.set("Select a clustering run to edit clusters.")
+        if self.manual_cluster_run_combo is not None:
+            self.manual_cluster_run_combo["values"] = []
+        if self.manual_cluster_listbox is not None:
+            self.manual_cluster_listbox.delete(0, tk.END)
         if hasattr(self, "clustering_umap_method_combo"):
             self.clustering_umap_method_combo["values"] = []
             self.clustering_umap_method_var.set("")
@@ -6991,16 +7531,9 @@ class FlowDataApp:
             return
 
         self.pending_clustering_labels = pending_labels
+        self.clustering_features_used = list(required_columns)
 
         dataset = dataset.reset_index(drop=True)
-        features = dataset[required_columns].to_numpy(dtype=float, copy=False)
-        scaler = StandardScaler()
-        features_scaled = scaler.fit_transform(features)
-
-        self.clustering_features_used = list(required_columns)
-        self.clustering_dataset_cache = dataset.copy()
-        self.clustering_feature_matrix = features_scaled.copy()
-        self.clustering_umap_cache.clear()
 
         downsample_method = self.clustering_downsample_method_var.get()
         downsample_value_raw = self.clustering_downsample_value_var.get().strip()
@@ -7051,6 +7584,36 @@ class FlowDataApp:
         }
         self.clustering_run_metadata_base = base_metadata.copy()
 
+        self.clustering_umap_cache.clear()
+
+        if self.clustering_incremental_var.get() and self.clustering_results:
+            try:
+                payload = self._incremental_clustering_update(
+                    dataset,
+                    base_metadata,
+                    selected_methods,
+                )
+            except ValueError as exc:
+                messagebox.showerror("Incremental clustering failed", str(exc))
+                return
+            self.clustering_in_progress = True
+            self.run_clustering_button.configure(state="disabled")
+            self.clustering_progress.start(12)
+            self.clustering_status_var.set("Incremental clustering in progress…")
+            self.root.after(50, lambda payload=payload: self._handle_clustering_success(payload))
+            return
+
+        features = dataset[required_columns].to_numpy(dtype=float, copy=False)
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+
+        self.clustering_dataset_cache = dataset.copy()
+        self.clustering_feature_matrix = features_scaled.copy()
+        self.clustering_incremental_scaler = {
+            "mean": scaler.mean_.tolist(),
+            "scale": scaler.scale_.tolist(),
+        }
+
         self.clustering_queue = queue.Queue()
         self.clustering_in_progress = True
         self.run_clustering_button.configure(state="disabled")
@@ -7068,6 +7631,8 @@ class FlowDataApp:
                 selected_methods,
                 clustering_jobs,
                 base_metadata,
+                scaler,
+                list(required_columns),
             ),
             daemon=True,
         )
