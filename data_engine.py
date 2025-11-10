@@ -33,6 +33,13 @@ except ImportError:  # pragma: no cover
 import numpy as np
 import pandas as pd
 
+try:  # pragma: no cover - optional dependency during runtime
+    import pyarrow.parquet as pq  # type: ignore[import]
+    PYARROW_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    pq = None  # type: ignore[assignment]
+    PYARROW_AVAILABLE = False
+
 
 DEFAULT_CACHE_CHUNK_SIZE = 200_000
 CACHE_MANIFEST_SUFFIX = ".json"
@@ -199,6 +206,28 @@ class DataEngine:
             filters,
         )
         return cache_path
+
+    def stream_dataset(
+        self,
+        signature: str,
+        columns: Sequence[str],
+        filters: Optional[str] = None,
+        batch_size: int = 50_000,
+    ) -> Iterator[pd.DataFrame]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer.")
+        cache_path = self.ensure_cached_dataset(signature, columns, filters)
+        requested = list(columns)
+        if PYARROW_AVAILABLE:
+            parquet_file = pq.ParquetFile(cache_path)
+            for batch in parquet_file.iter_batches(columns=requested, batch_size=batch_size):
+                yield batch.to_pandas()
+            return
+        dataframe = pd.read_parquet(cache_path, columns=requested)
+        total_rows = len(dataframe)
+        for start in range(0, total_rows, batch_size):
+            stop = start + batch_size
+            yield dataframe.iloc[start:stop].copy()
 
     def column_stats(self, column: str, numeric: bool) -> Dict[str, object]:
         if not self.file_views:
