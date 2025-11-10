@@ -11,6 +11,7 @@ python-igraph>=0.11
 leidenalg>=0.10
 MiniSom>=2.3
 umap-learn>=0.5
+hdbscan>=0.8
 duckdb>=0.10
 polars>=0.20
 pyarrow>=16.0
