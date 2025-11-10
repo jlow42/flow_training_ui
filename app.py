@@ -1,4 +1,5 @@
 import copy
+import logging
 import re
 import sys
 import tkinter as tk
@@ -34,6 +35,9 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from error_handling import ErrorManager, ErrorRecord
+from logging_config import configure_logging
+from telemetry import TelemetryError, TelemetryManager
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -350,6 +354,24 @@ class FlowDataApp:
         self.app_dir = Path(__file__).resolve().parent
         self.cache_dir = self.app_dir / ".flow_cache"
         self.cache_dir.mkdir(exist_ok=True)
+        self.log_dir = self.cache_dir / "logs"
+        self.logger, self.log_path = configure_logging(self.log_dir)
+        self.logger.info("Launching Flow Cytometry Data Preparation UI")
+
+        self.telemetry_dir = self.cache_dir / "telemetry"
+        self.telemetry_manager = TelemetryManager(self.telemetry_dir, self.logger)
+        self.telemetry_opt_in_var = tk.BooleanVar(value=self.telemetry_manager.opted_in)
+        self.telemetry_manager.record_event(
+            "app_started",
+            {"platform": sys.platform, "python_version": sys.version.split()[0]},
+        )
+
+        self.error_manager = ErrorManager()
+        self.error_manager.set_log_path(self.log_path)
+        self.error_indicator_var = tk.StringVar(value="No recent errors")
+        self._error_dialog: Optional[tk.Toplevel] = None
+        self._error_dialog_text: Optional[tk.Text] = None
+
         self.data_engine = DataEngine(self.cache_dir)
         self.schema_report: List[Dict[str, object]] = []
         self.quality_overview: Dict[str, object] = {}
@@ -385,6 +407,39 @@ class FlowDataApp:
         self.training_hint_var = tk.StringVar(
             value="Load files to populate feature options."
         )
+
+        self._original_showerror = messagebox.showerror
+
+        def _showerror_with_guidance(title, message, **kwargs):
+            resolved_title = title or "Error"
+            resolved_message = str(message)
+            details = kwargs.get("detail") if isinstance(kwargs, dict) else None
+            record = self.error_manager.register_error(
+                resolved_title,
+                resolved_message,
+                details=str(details) if details else None,
+            )
+            self.logger.error("UI error: %s - %s", record.title, record.message)
+            self._update_error_indicator(record)
+            try:
+                self.telemetry_manager.record_event(
+                    "ui_error",
+                    {"title": record.title, "guidance": record.guidance[:200]},
+                    sensitive_keys={"details"},
+                )
+            except Exception:
+                self.logger.debug("Failed to record telemetry for UI error", exc_info=True)
+
+            display_kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
+            if details:
+                display_kwargs["detail"] = f"{details}\n\nGuidance: {record.guidance}"
+                display_message = resolved_message
+            else:
+                display_message = record.formatted_message
+            return self._original_showerror(resolved_title, display_message, **display_kwargs)
+
+        messagebox.showerror = _showerror_with_guidance  # type: ignore[assignment]
+        self._update_error_indicator()
 
         self.training_downsample_method_var = tk.StringVar(value="None")
         self.training_downsample_value_var = tk.StringVar(value="")
@@ -7139,6 +7194,7 @@ class FlowDataApp:
                 "No rows remain after dropping records with missing feature/target values.",
             )
             return
+        dataset_rows = len(dataset)
 
         non_numeric_features = [
             column
@@ -7205,6 +7261,24 @@ class FlowDataApp:
             "features": list(self.training_selection),
             "target": target_column,
         }
+
+        self.logger.info(
+            "Starting training: model=%s, features=%s, rows=%s, cv=%s",
+            model_name,
+            len(self.training_selection),
+            dataset_rows,
+            cv_folds,
+        )
+        self.telemetry_manager.record_event(
+            "training_started",
+            {
+                "model": model_name,
+                "feature_count": len(self.training_selection),
+                "rows": dataset_rows,
+                "cv_folds": cv_folds,
+                "test_size": round(float(test_size), 3),
+            },
+        )
 
         self.training_results = {}
         self.training_queue = queue.Queue()
@@ -7859,6 +7933,22 @@ class FlowDataApp:
         if extra_status:
             status_message += f" {extra_status}"
         self.training_status_var.set(status_message)
+        self.logger.info(
+            "Training complete: model=%s accuracy=%.3f f1=%.3f",
+            payload.get("model_name", "unknown"),
+            accuracy,
+            f1_macro,
+        )
+        self.telemetry_manager.record_event(
+            "training_completed",
+            {
+                "model": payload.get("model_name", "unknown"),
+                "accuracy": round(float(accuracy), 4),
+                "f1_macro": round(float(f1_macro), 4),
+                "train_rows": int(payload.get("train_rows", 0)),
+                "test_rows": int(payload.get("test_rows", 0)),
+            },
+        )
 
         cv_scores = payload.get("cv_scores")
         cv_warning = payload.get("cv_warning", "")
@@ -7890,6 +7980,10 @@ class FlowDataApp:
         self.training_progress.stop()
         self.train_button.configure(state="normal")
         self.training_status_var.set(f"Training failed: {message}")
+        self.logger.error("Training failed: %s", message)
+        self.telemetry_manager.record_event(
+            "training_failed", {"message": message[:200]}
+        )
         messagebox.showerror("Training error", message)
 
     def _update_metrics_display(self, payload: Dict[str, object]) -> None:
@@ -8096,6 +8190,139 @@ class FlowDataApp:
             side="left"
         )
 
+        controls = ttk.Frame(status_frame)
+        controls.pack(side="right", padx=8)
+
+        self.error_indicator_label = tk.Label(
+            controls,
+            textvariable=self.error_indicator_var,
+            fg="#2e7d32",
+            anchor="w",
+        )
+        self.error_indicator_label.pack(side="right", padx=(0, 8))
+
+        ttk.Button(controls, text="Errors…", command=self._open_error_dialog).pack(
+            side="right", padx=(0, 8)
+        )
+
+        ttk.Checkbutton(
+            controls,
+            text="Share anonymous usage",
+            variable=self.telemetry_opt_in_var,
+            command=self._on_toggle_telemetry,
+        ).pack(side="right")
+
+    def _on_toggle_telemetry(self) -> None:
+        desired_state = bool(self.telemetry_opt_in_var.get())
+        try:
+            self.telemetry_manager.set_opt_in(desired_state)
+        except TelemetryError as exc:
+            self.logger.exception("Failed to update telemetry preference")
+            self.telemetry_opt_in_var.set(not desired_state)
+            messagebox.showerror(
+                "Telemetry error",
+                "Unable to update telemetry preference. Please try again.",
+                detail=str(exc),
+            )
+            return
+
+        if desired_state:
+            self.status_var.set("Telemetry sharing enabled.")
+            self.telemetry_manager.record_event(
+                "telemetry_preference_changed", {"state": "enabled"}
+            )
+        else:
+            self.status_var.set("Telemetry sharing disabled.")
+            self.logger.info("Telemetry disabled; existing events purged.")
+
+    def _update_error_indicator(self, record: Optional[ErrorRecord] = None) -> None:
+        latest_record = record
+        if latest_record is None:
+            recent = self.error_manager.get_recent()
+            latest_record = recent[-1] if recent else None
+
+        if latest_record is None:
+            self.error_indicator_var.set("No recent errors")
+            self.error_indicator_label.configure(fg="#2e7d32")
+        else:
+            timestamp = latest_record.timestamp.strftime("%H:%M:%S")
+            self.error_indicator_var.set(
+                f"Last error {timestamp}: {latest_record.title}"
+            )
+            self.error_indicator_label.configure(fg="#c62828")
+        self._refresh_error_dialog()
+
+    def _open_error_dialog(self) -> None:
+        if self._error_dialog is not None and tk.Toplevel.winfo_exists(self._error_dialog):
+            self._error_dialog.lift()
+            self._error_dialog.focus_set()
+            self._refresh_error_dialog()
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Recent errors")
+        dialog.geometry("720x360")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(
+            dialog,
+            text=f"Application log: {self.log_path}",
+            padding=(12, 6),
+            wraplength=680,
+        ).pack(anchor="w")
+
+        text_widget = tk.Text(dialog, wrap="word", state="disabled")
+        text_widget.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill="x", padx=12, pady=(0, 12))
+
+        ttk.Button(
+            button_frame,
+            text="Clear history",
+            command=self._clear_error_history,
+        ).pack(side="left")
+        ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="right")
+
+        dialog.bind("<Destroy>", self._on_error_dialog_closed)
+
+        self._error_dialog = dialog
+        self._error_dialog_text = text_widget
+        self._refresh_error_dialog()
+
+    def _refresh_error_dialog(self) -> None:
+        if self._error_dialog_text is None:
+            return
+
+        text_widget = self._error_dialog_text
+        text_widget.configure(state="normal")
+        text_widget.delete("1.0", tk.END)
+        records = self.error_manager.get_recent()
+        if not records:
+            text_widget.insert("1.0", "No errors captured this session.")
+        else:
+            for record in records:
+                timestamp = record.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+                text_widget.insert(
+                    tk.END,
+                    f"{timestamp} — {record.title}\n{record.message}\nGuidance: {record.guidance}\n",
+                )
+                if record.details:
+                    text_widget.insert(tk.END, f"Details: {record.details}\n")
+                text_widget.insert(tk.END, "\n")
+        text_widget.configure(state="disabled")
+
+    def _clear_error_history(self) -> None:
+        self.error_manager.clear()
+        self._update_error_indicator()
+        self.status_var.set("Cleared error history.")
+
+    def _on_error_dialog_closed(self, event: tk.Event) -> None:
+        if event.widget is self._error_dialog:
+            self._error_dialog = None
+            self._error_dialog_text = None
+
     def select_files(self) -> None:
         file_paths = filedialog.askopenfilenames(
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
@@ -8115,11 +8342,14 @@ class FlowDataApp:
         loaded: List[DataFile] = []
         errors: List[str] = []
 
+        self.logger.info("Loading %s file(s).", len(paths))
+
         for path in paths:
             try:
                 metadata = self._build_data_file_metadata(path)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{path.name}: {exc}")
+                self.logger.warning("Failed to process file '%s': %s", path, exc)
                 continue
 
             loaded.append(metadata)
@@ -8129,14 +8359,35 @@ class FlowDataApp:
             self.files_loaded_var.set("No files loaded")
             if not errors:
                 errors.append("No files provided.")
+            self.telemetry_manager.record_event(
+                "files_loaded",
+                {
+                    "requested_files": len(paths),
+                    "loaded_files": 0,
+                    "error_count": len(errors),
+                },
+            )
             return errors
 
         self.data_files = loaded
         self.status_var.set(f"Loaded {len(self.data_files)} files")
         self.files_loaded_var.set(f"{len(self.data_files)} files loaded")
+        self.logger.info(
+            "Loaded %s file(s) successfully with %s error(s).",
+            len(self.data_files),
+            len(errors),
+        )
 
         self._refresh_views()
         self._mark_session_dirty()
+        self.telemetry_manager.record_event(
+            "files_loaded",
+            {
+                "requested_files": len(paths),
+                "loaded_files": len(loaded),
+                "error_count": len(errors),
+            },
+        )
         return errors
 
     def _build_data_file_metadata(self, path: Path) -> DataFile:
@@ -8184,6 +8435,15 @@ class FlowDataApp:
         else:
             self.status_var.set("All files removed.")
             self.files_loaded_var.set("No files loaded")
+
+        self.logger.info("Removed %s file(s); %s remain.", removed_count, len(self.data_files))
+        self.telemetry_manager.record_event(
+            "files_removed",
+            {
+                "removed": removed_count,
+                "remaining": len(self.data_files),
+            },
+        )
 
     def _refresh_views(self) -> None:
         self._clear_training_state()
