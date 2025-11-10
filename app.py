@@ -33,7 +33,7 @@ from matplotlib.axes import Axes
 from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
-from data_engine import DataEngine, DataEngineError
+from data_engine import DataEngine, DataEngineConfig, DataEngineError
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -350,7 +350,7 @@ class FlowDataApp:
         self.app_dir = Path(__file__).resolve().parent
         self.cache_dir = self.app_dir / ".flow_cache"
         self.cache_dir.mkdir(exist_ok=True)
-        self.data_engine = DataEngine(self.cache_dir)
+        self.data_engine = DataEngine(self.cache_dir, DataEngineConfig.from_env())
         self.schema_report: List[Dict[str, object]] = []
         self.quality_overview: Dict[str, object] = {}
         self.session_path = self.cache_dir / "session_state.json"
