@@ -1,0 +1,135 @@
+{
+  "generated_at": "2025-11-06T21:17:26Z",
+  "base": {
+    "timestamp": 1762463755.328497,
+    "timestamp_iso": "2025-11-06T21:15:55Z",
+    "files": [
+      "/Users/lownikj/training_program/test_data/8256.t001.w.pred.csv"
+    ],
+    "features": [
+      "CD10",
+      "CD117",
+      "CD11b",
+      "CD11c",
+      "CD123",
+      "CD13",
+      "CD14",
+      "CD15",
+      "CD16",
+      "CD19",
+      "CD2",
+      "CD20",
+      "CD22",
+      "CD23",
+      "CD3",
+      "CD33",
+      "CD34",
+      "CD38",
+      "CD4.LAMBDA",
+      "CD45"
+    ],
+    "total_rows_files": 170811,
+    "rows_after_downsampling": 20549,
+    "rows_used": 20549,
+    "downsampling": {
+      "method": "None",
+      "value": null,
+      "class_column": "CD45_exclusion"
+    },
+    "n_jobs": 9,
+    "subset": {
+      "name": null,
+      "filters": [
+        {
+          "column": "Class",
+          "type": "categorical",
+          "values": [
+            "Lymphoid"
+          ],
+          "min": null,
+          "max": null
+        }
+      ],
+      "rows_after_filters": 20549,
+      "logic": "AND"
+    }
+  },
+  "methods": {
+    "kmeans:k10_max_iter300_n_init10": {
+      "timestamp": 1762463755.328497,
+      "timestamp_iso": "2025-11-06T21:15:55Z",
+      "files": [
+        "/Users/lownikj/training_program/test_data/8256.t001.w.pred.csv"
+      ],
+      "features": [
+        "CD10",
+        "CD117",
+        "CD11b",
+        "CD11c",
+        "CD123",
+        "CD13",
+        "CD14",
+        "CD15",
+        "CD16",
+        "CD19",
+        "CD2",
+        "CD20",
+        "CD22",
+        "CD23",
+        "CD3",
+        "CD33",
+        "CD34",
+        "CD38",
+        "CD4.LAMBDA",
+        "CD45"
+      ],
+      "total_rows_files": 170811,
+      "rows_after_downsampling": 20549,
+      "rows_used": 20549,
+      "downsampling": {
+        "method": "None",
+        "value": null,
+        "class_column": "CD45_exclusion"
+      },
+      "n_jobs": 9,
+      "subset": {
+        "name": null,
+        "filters": [
+          {
+            "column": "Class",
+            "type": "categorical",
+            "values": [
+              "Lymphoid"
+            ],
+            "min": null,
+            "max": null
+          }
+        ],
+        "rows_after_filters": 20549,
+        "logic": "AND"
+      },
+      "run_key": "kmeans:k10_max_iter300_n_init10",
+      "method_key": "kmeans",
+      "method_label": "KMeans (k=10, iter=300, n_init=10)",
+      "params": {
+        "n_clusters": 10,
+        "max_iter": 300,
+        "n_init": 10
+      },
+      "cluster_count": 10,
+      "elapsed_sec": 0.38410210609436035,
+      "cluster_sizes": {
+        "0": 802,
+        "1": 2809,
+        "2": 4938,
+        "3": 2501,
+        "4": 1531,
+        "5": 2938,
+        "6": 1179,
+        "7": 1546,
+        "8": 2233,
+        "9": 72
+      }
+    }
+  }
+}
