@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -26,13 +26,20 @@ import pandas as pd
 import seaborn as sns
 from matplotlib import cm
 from matplotlib.lines import Line2D
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.colors import ListedColormap
 from matplotlib.axes import Axes
 from matplotlib.patches import Polygon, Rectangle
+from matplotlib.widgets import LassoSelector
 from pandas.api.types import is_numeric_dtype
 
+from cluster_linking import (
+    build_table_rows,
+    filter_by_limits,
+    select_points_within_path,
+    summarize_clusters,
+)
 from data_engine import DataEngine, DataEngineError
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
@@ -100,6 +107,13 @@ except ImportError:
     nn = None  # type: ignore[assignment]
     TensorDataset = None  # type: ignore[assignment]
 
+try:
+    import datashader as ds  # type: ignore[import]
+    from datashader import transfer_functions as tf  # type: ignore[import]
+except ImportError:
+    ds = None  # type: ignore[assignment]
+    tf = None  # type: ignore[assignment]
+
 
 RANDOM_STATE = 42
 MAX_UNIQUE_CATEGORY_SAMPLE = 200
@@ -108,6 +122,8 @@ MAX_CLUSTER_COMPARE_CATEGORIES = 30
 CSV_METADATA_SAMPLE_ROWS = 5000
 DEFAULT_CSV_CHUNKSIZE = 200_000
 IS_DARWIN = sys.platform == "darwin"
+CLUSTER_EXPLORER_TABLE_MAX_ROWS = 200
+CLUSTER_EXPLORER_DENSE_THRESHOLD = 25000
 
 
 class ScrollableFrame(ttk.Frame):
@@ -743,6 +759,22 @@ class FlowDataApp:
         self.cluster_explorer_dot_size_var = tk.DoubleVar(value=12.0)
         self.cluster_explorer_alpha_var = tk.DoubleVar(value=0.8)
         self.cluster_explorer_feature_menu: Optional[tk.Menu] = None
+        self.cluster_explorer_render_mode_var = tk.StringVar(value="Scatter")
+        self.cluster_explorer_render_mode_combo: Optional[ttk.Combobox] = None
+        self.cluster_explorer_selection_tree: Optional[ttk.Treeview] = None
+        self.cluster_explorer_selection_summary_var = tk.StringVar(
+            value="Select a plot to explore the current view."
+        )
+        self.cluster_explorer_snapshot_tree: Optional[ttk.Treeview] = None
+        self.cluster_explorer_snapshot_summary_var = tk.StringVar(
+            value="No comparison snapshot saved."
+        )
+        self.cluster_explorer_active_selection: Optional[Dict[str, object]] = None
+        self.cluster_explorer_snapshot_selection: Optional[Dict[str, object]] = None
+        self.cluster_explorer_active_plot_index: Optional[int] = None
+        self.cluster_explorer_snapshot_button: Optional[ttk.Button] = None
+        self.cluster_explorer_clear_selection_button: Optional[ttk.Button] = None
+        self.cluster_explorer_clear_snapshot_button: Optional[ttk.Button] = None
         self.pending_clustering_labels: Dict[str, str] = {}
         self.cluster_annotation_method_var = tk.StringVar()
         self.cluster_annotations: Dict[str, pd.DataFrame] = {}
@@ -2666,12 +2698,39 @@ class FlowDataApp:
         alpha_spin.pack(anchor="w")
         alpha_spin.bind("<FocusOut>", lambda _e: self._on_cluster_explorer_style_change())
         alpha_spin.bind("<Return>", lambda _e: self._on_cluster_explorer_style_change())
+        ttk.Label(style_frame, text="Render mode").pack(anchor="w", pady=(8, 0))
+        render_combo = ttk.Combobox(
+            style_frame,
+            textvariable=self.cluster_explorer_render_mode_var,
+            state="readonly",
+            values=self._get_cluster_explorer_render_mode_choices(),
+            width=12,
+        )
+        render_combo.pack(anchor="w")
+        render_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_cluster_explorer_render_mode_change()
+        )
+        self.cluster_explorer_render_mode_combo = render_combo
 
-        plots_frame = ttk.Frame(explorer_tab)
-        plots_frame.pack(fill="both", expand=True, pady=(12, 0))
+        paned = ttk.PanedWindow(explorer_tab, orient=tk.HORIZONTAL)
+        paned.pack(fill="both", expand=True, pady=(12, 0))
+
+        plots_container = ttk.Frame(paned)
+        plots_container.columnconfigure(0, weight=1)
+        plots_container.rowconfigure(0, weight=1)
+        paned.add(plots_container, weight=3)
+
+        plots_frame = ttk.Frame(plots_container)
+        plots_frame.grid(row=0, column=0, sticky="nsew")
         plots_frame.grid_columnconfigure(0, weight=1)
         plots_frame.grid_columnconfigure(1, weight=1)
         plots_frame.grid_columnconfigure(2, weight=1)
+
+        details_container = ttk.Frame(paned)
+        details_container.columnconfigure(0, weight=1)
+        details_container.rowconfigure(0, weight=1)
+        paned.add(details_container, weight=2)
+        self._init_cluster_explorer_details(details_container)
 
         self.cluster_explorer_plots.clear()
         total_plots = 6
@@ -2701,6 +2760,9 @@ class FlowDataApp:
             canvas_widget = canvas.get_tk_widget()
             canvas_widget.pack(fill="both", expand=True)
             self._make_canvas_responsive(canvas, fig, min_height=220)
+            toolbar = NavigationToolbar2Tk(canvas, plot_container, pack_toolbar=False)
+            toolbar.update()
+            toolbar.pack(side="bottom", fill="x")
             cid = canvas.mpl_connect(
                 "button_press_event",
                 partial(self._handle_cluster_explorer_axis_click, index),
@@ -2713,8 +2775,552 @@ class FlowDataApp:
                 "x_feature": None,
                 "y_feature": None,
                 "connection": cid,
+                "toolbar": toolbar,
+                "lasso": None,
+                "selection_artist": None,
+                "row_ids": None,
+                "x_data": None,
+                "y_data": None,
+                "cluster_labels": None,
+                "current_dataframe": None,
+                "current_view_subset": None,
+                "xlim_cid": None,
+                "ylim_cid": None,
             }
             self.cluster_explorer_plots.append(plot_info)
+
+    def _init_cluster_explorer_details(self, container: ttk.Frame) -> None:
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_rowconfigure(1, weight=1)
+
+        selection_frame = ttk.LabelFrame(
+            container, text="Current View / Selection", padding=8
+        )
+        selection_frame.grid(row=0, column=0, sticky="nsew")
+
+        selection_controls = ttk.Frame(selection_frame)
+        selection_controls.pack(fill="x", expand=False)
+        clear_button = ttk.Button(
+            selection_controls,
+            text="Clear Selection",
+            command=self._clear_cluster_explorer_selection,
+            state="disabled",
+        )
+        clear_button.pack(side="left")
+        self.cluster_explorer_clear_selection_button = clear_button
+        snapshot_button = ttk.Button(
+            selection_controls,
+            text="Save Snapshot",
+            command=self._save_cluster_explorer_snapshot,
+            state="disabled",
+        )
+        snapshot_button.pack(side="left", padx=(6, 0))
+        self.cluster_explorer_snapshot_button = snapshot_button
+
+        current_tree_frame = ttk.Frame(selection_frame)
+        current_tree_frame.pack(fill="both", expand=True, pady=(6, 0))
+        columns = ("row", "cluster", "x", "y")
+        tree = ttk.Treeview(
+            current_tree_frame, columns=columns, show="headings", height=12
+        )
+        tree.pack(side="left", fill="both", expand=True)
+        scroll_y = ttk.Scrollbar(
+            current_tree_frame, orient="vertical", command=tree.yview
+        )
+        scroll_y.pack(side="right", fill="y")
+        tree.configure(yscrollcommand=scroll_y.set)
+        headings = {
+            "row": "Row",
+            "cluster": "Cluster",
+            "x": "X",
+            "y": "Y",
+        }
+        for key, label in headings.items():
+            tree.heading(key, text=label)
+            tree.column(key, anchor="center", width=80)
+        tree.column("row", anchor="w", width=100)
+        self.cluster_explorer_selection_tree = tree
+
+        ttk.Label(
+            selection_frame,
+            textvariable=self.cluster_explorer_selection_summary_var,
+            wraplength=360,
+            justify="left",
+            foreground="#444444",
+        ).pack(fill="x", expand=False, pady=(6, 0))
+
+        snapshot_frame = ttk.LabelFrame(
+            container, text="Comparison Snapshot", padding=8
+        )
+        snapshot_frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+
+        snapshot_controls = ttk.Frame(snapshot_frame)
+        snapshot_controls.pack(fill="x", expand=False)
+        clear_snapshot_button = ttk.Button(
+            snapshot_controls,
+            text="Clear Snapshot",
+            command=self._clear_cluster_explorer_snapshot,
+            state="disabled",
+        )
+        clear_snapshot_button.pack(side="left")
+        self.cluster_explorer_clear_snapshot_button = clear_snapshot_button
+
+        snapshot_tree_frame = ttk.Frame(snapshot_frame)
+        snapshot_tree_frame.pack(fill="both", expand=True, pady=(6, 0))
+        snapshot_tree = ttk.Treeview(
+            snapshot_tree_frame, columns=columns, show="headings", height=10
+        )
+        snapshot_tree.pack(side="left", fill="both", expand=True)
+        snap_scroll = ttk.Scrollbar(
+            snapshot_tree_frame, orient="vertical", command=snapshot_tree.yview
+        )
+        snap_scroll.pack(side="right", fill="y")
+        snapshot_tree.configure(yscrollcommand=snap_scroll.set)
+        for key, label in headings.items():
+            snapshot_tree.heading(key, text=label)
+            snapshot_tree.column(key, anchor="center", width=80)
+        snapshot_tree.column("row", anchor="w", width=100)
+        self.cluster_explorer_snapshot_tree = snapshot_tree
+
+        ttk.Label(
+            snapshot_frame,
+            textvariable=self.cluster_explorer_snapshot_summary_var,
+            wraplength=360,
+            justify="left",
+            foreground="#444444",
+        ).pack(fill="x", expand=False, pady=(6, 0))
+
+    def _get_cluster_explorer_render_mode_choices(self) -> List[str]:
+        return ["Scatter", "Hexbin", "Datashader"]
+
+    def _on_cluster_explorer_render_mode_change(self) -> None:
+        self._reset_cluster_explorer_selections()
+        self._update_all_cluster_explorer_plots()
+
+    def _reset_cluster_explorer_selections(self) -> None:
+        self.cluster_explorer_active_selection = None
+        self.cluster_explorer_active_plot_index = None
+        self.cluster_explorer_snapshot_selection = None
+        for plot in self.cluster_explorer_plots:
+            self._clear_plot_selection_artist(plot, redraw=False)
+        self._refresh_cluster_explorer_selection_table()
+        self._refresh_cluster_explorer_snapshot_table()
+        self._update_cluster_explorer_selection_highlights()
+
+    def _refresh_cluster_explorer_selection_table(self) -> None:
+        tree = self.cluster_explorer_selection_tree
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        selection = self.cluster_explorer_active_selection
+        if not selection or selection.get("df") is None:
+            self.cluster_explorer_selection_summary_var.set(
+                "Select a plot to explore the current view."
+            )
+            if self.cluster_explorer_clear_selection_button is not None:
+                self.cluster_explorer_clear_selection_button.configure(state="disabled")
+            if self.cluster_explorer_snapshot_button is not None:
+                self.cluster_explorer_snapshot_button.configure(state="disabled")
+            return
+        dataframe = selection.get("df")
+        x_feature = selection.get("x_feature")
+        y_feature = selection.get("y_feature")
+        rows = build_table_rows(
+            dataframe,
+            str(x_feature) if x_feature else "",
+            str(y_feature) if y_feature else "",
+            CLUSTER_EXPLORER_TABLE_MAX_ROWS,
+        )
+        for row in rows:
+            tree.insert("", "end", values=row)
+        summary = self._format_cluster_explorer_summary(selection)
+        self.cluster_explorer_selection_summary_var.set(summary)
+        if self.cluster_explorer_clear_selection_button is not None:
+            self.cluster_explorer_clear_selection_button.configure(state="normal")
+        if self.cluster_explorer_snapshot_button is not None:
+            has_rows = dataframe is not None and not dataframe.empty
+            self.cluster_explorer_snapshot_button.configure(
+                state="normal" if has_rows else "disabled"
+            )
+
+    def _refresh_cluster_explorer_snapshot_table(self) -> None:
+        tree = self.cluster_explorer_snapshot_tree
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        snapshot = self.cluster_explorer_snapshot_selection
+        if not snapshot or snapshot.get("df") is None:
+            self.cluster_explorer_snapshot_summary_var.set("No comparison snapshot saved.")
+            if self.cluster_explorer_clear_snapshot_button is not None:
+                self.cluster_explorer_clear_snapshot_button.configure(state="disabled")
+            return
+        dataframe = snapshot.get("df")
+        x_feature = snapshot.get("x_feature")
+        y_feature = snapshot.get("y_feature")
+        rows = build_table_rows(
+            dataframe,
+            str(x_feature) if x_feature else "",
+            str(y_feature) if y_feature else "",
+            CLUSTER_EXPLORER_TABLE_MAX_ROWS,
+        )
+        for row in rows:
+            tree.insert("", "end", values=row)
+        summary = self._format_cluster_explorer_summary(snapshot, snapshot_mode=True)
+        self.cluster_explorer_snapshot_summary_var.set(summary)
+        if self.cluster_explorer_clear_snapshot_button is not None:
+            self.cluster_explorer_clear_snapshot_button.configure(state="normal")
+
+    def _clear_cluster_explorer_selection(self) -> None:
+        self.cluster_explorer_active_selection = None
+        self.cluster_explorer_active_plot_index = None
+        self._update_cluster_explorer_selection_highlights()
+        for plot in self.cluster_explorer_plots:
+            view_df = plot.get("current_view_subset")
+            if view_df is not None and not view_df.empty:
+                selection = {
+                    "mode": "view",
+                    "plot": plot.get("index"),
+                    "df": view_df,
+                    "x_feature": plot.get("x_feature"),
+                    "y_feature": plot.get("y_feature"),
+                    "source": "view",
+                }
+                self.cluster_explorer_active_plot_index = plot.get("index")
+                self.cluster_explorer_active_selection = selection
+                break
+        self._refresh_cluster_explorer_selection_table()
+        self._update_cluster_explorer_selection_highlights()
+
+    def _save_cluster_explorer_snapshot(self) -> None:
+        selection = self.cluster_explorer_active_selection
+        dataframe = selection.get("df") if selection else None
+        if selection is None or dataframe is None or dataframe.empty:
+            self.cluster_explorer_status_var.set("No selection available to snapshot.")
+            return
+        snapshot = {
+            "df": dataframe.copy(),
+            "x_feature": selection.get("x_feature"),
+            "y_feature": selection.get("y_feature"),
+            "mode": selection.get("mode"),
+            "plot": selection.get("plot"),
+            "timestamp": time.time(),
+        }
+        self.cluster_explorer_snapshot_selection = snapshot
+        self._refresh_cluster_explorer_snapshot_table()
+        self.cluster_explorer_status_var.set("Snapshot saved for side-by-side comparison.")
+
+    def _clear_cluster_explorer_snapshot(self) -> None:
+        self.cluster_explorer_snapshot_selection = None
+        self._refresh_cluster_explorer_snapshot_table()
+
+    def _format_cluster_explorer_summary(
+        self, selection: Dict[str, object], snapshot_mode: bool = False
+    ) -> str:
+        dataframe = selection.get("df")
+        if dataframe is None or dataframe.empty:
+            return "No rows available."
+        summary = summarize_clusters(dataframe)
+        cluster_tokens = [
+            f"{cluster}: {count}"
+            for cluster, count in sorted(summary.cluster_counts.items())
+        ]
+        mode = selection.get("mode", "view")
+        prefix = "Snapshot" if snapshot_mode else ("Selected" if mode == "lasso" else "In view")
+        feature_desc = f"{selection.get('x_feature')} vs {selection.get('y_feature')}"
+        parts = [f"{prefix}: {summary.total_rows} rows", f"Features: {feature_desc}"]
+        if cluster_tokens:
+            parts.append(f"Clusters: {', '.join(cluster_tokens)}")
+        plot_index = selection.get("plot")
+        if isinstance(plot_index, int):
+            parts.append(f"Plot {plot_index + 1}")
+        if snapshot_mode:
+            timestamp = selection.get("timestamp")
+            if isinstance(timestamp, (int, float)):
+                parts.append(time.strftime("Saved %H:%M:%S", time.localtime(timestamp)))
+        elif mode == "lasso":
+            parts.append("Lasso selection")
+        return " | ".join(parts)
+
+    def _update_cluster_explorer_selection_highlights(self) -> None:
+        selection = self.cluster_explorer_active_selection
+        selected_ids = None
+        if selection and selection.get("mode") == "lasso":
+            selected_ids = selection.get("selected_row_ids")
+        for plot in self.cluster_explorer_plots:
+            self._update_plot_highlight(plot, selected_ids)
+
+    def _update_plot_highlight(
+        self, plot_info: Dict[str, Any], selected_ids: Optional[np.ndarray]
+    ) -> None:
+        self._clear_plot_selection_artist(plot_info, redraw=False)
+        canvas: Optional[FigureCanvasTkAgg] = plot_info.get("canvas")
+        if selected_ids is None or selected_ids is False:
+            if canvas is not None:
+                canvas.draw_idle()
+            return
+        row_ids = plot_info.get("row_ids")
+        x_data = plot_info.get("x_data")
+        y_data = plot_info.get("y_data")
+        ax: Optional[Axes] = plot_info.get("ax")
+        if (
+            row_ids is None
+            or x_data is None
+            or y_data is None
+            or ax is None
+            or canvas is None
+        ):
+            return
+        mask = np.isin(row_ids, selected_ids)
+        if not np.any(mask):
+            canvas.draw_idle()
+            return
+        highlight = ax.scatter(
+            x_data[mask],
+            y_data[mask],
+            facecolors="none",
+            edgecolors="#222222",
+            linewidths=1.0,
+            s=max(25.0, float(self.cluster_explorer_dot_size_var.get()) * 2.0),
+            zorder=5,
+        )
+        plot_info["selection_artist"] = highlight
+        canvas.draw_idle()
+
+    def _clear_plot_selection_artist(
+        self, plot_info: Dict[str, Any], redraw: bool = True
+    ) -> None:
+        artist = plot_info.get("selection_artist")
+        if artist is not None:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+            finally:
+                plot_info["selection_artist"] = None
+        if redraw and plot_info.get("canvas") is not None:
+            plot_info["canvas"].draw_idle()
+
+    def _disconnect_plot_interactions(self, plot_info: Dict[str, Any]) -> None:
+        lasso = plot_info.get("lasso")
+        if lasso is not None:
+            try:
+                lasso.disconnect_events()
+            except Exception:
+                pass
+            finally:
+                plot_info["lasso"] = None
+        ax: Optional[Axes] = plot_info.get("ax")
+        if ax is not None:
+            xlim_cid = plot_info.get("xlim_cid")
+            ylim_cid = plot_info.get("ylim_cid")
+            if xlim_cid is not None:
+                try:
+                    ax.callbacks.disconnect(xlim_cid)
+                except Exception:
+                    pass
+                plot_info["xlim_cid"] = None
+            if ylim_cid is not None:
+                try:
+                    ax.callbacks.disconnect(ylim_cid)
+                except Exception:
+                    pass
+                plot_info["ylim_cid"] = None
+        self._clear_plot_selection_artist(plot_info, redraw=False)
+
+    def _register_plot_axis_callbacks(self, plot_info: Dict[str, Any]) -> None:
+        ax: Optional[Axes] = plot_info.get("ax")
+        if ax is None:
+            return
+        plot_info["xlim_cid"] = ax.callbacks.connect(
+            "xlim_changed",
+            lambda _axis: self._on_cluster_explorer_view_changed(plot_info),
+        )
+        plot_info["ylim_cid"] = ax.callbacks.connect(
+            "ylim_changed",
+            lambda _axis: self._on_cluster_explorer_view_changed(plot_info),
+        )
+
+    def _on_cluster_explorer_view_changed(self, plot_info: Dict[str, Any]) -> None:
+        if (
+            self.cluster_explorer_active_selection is not None
+            and self.cluster_explorer_active_selection.get("mode") == "lasso"
+        ):
+            return
+        dataframe = plot_info.get("current_dataframe")
+        x_feature = plot_info.get("x_feature")
+        y_feature = plot_info.get("y_feature")
+        ax: Optional[Axes] = plot_info.get("ax")
+        if (
+            dataframe is None
+            or dataframe.empty
+            or not x_feature
+            or not y_feature
+            or ax is None
+        ):
+            return
+        subset = filter_by_limits(
+            dataframe,
+            str(x_feature),
+            str(y_feature),
+            ax.get_xlim(),
+            ax.get_ylim(),
+        )
+        plot_info["current_view_subset"] = subset
+        self.cluster_explorer_active_selection = {
+            "mode": "view",
+            "plot": plot_info.get("index"),
+            "df": subset,
+            "x_feature": x_feature,
+            "y_feature": y_feature,
+            "source": "view",
+        }
+        self.cluster_explorer_active_plot_index = plot_info.get("index")
+        self._refresh_cluster_explorer_selection_table()
+        self._update_cluster_explorer_selection_highlights()
+
+    def _resolve_cluster_explorer_render_mode(self) -> str:
+        mode_label = self.cluster_explorer_render_mode_var.get().lower()
+        if mode_label.startswith("datashader"):
+            if ds is None or tf is None:
+                return "hexbin"
+            return "datashader"
+        if mode_label not in {"scatter", "hexbin"}:
+            return "scatter"
+        return mode_label
+
+    @staticmethod
+    def _get_figure_pixels(figure: Figure) -> Tuple[int, int]:
+        width, height = figure.get_size_inches()
+        dpi = figure.get_dpi() or 100.0
+        return max(int(width * dpi), 200), max(int(height * dpi), 200)
+
+    @staticmethod
+    def _rgba_to_hex(color: Tuple[float, float, float, float]) -> str:
+        r, g, b = [max(0, min(255, int(round(component * 255.0)))) for component in color[:3]]
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _render_cluster_explorer_with_datashader(
+        self,
+        plot_info: Dict[str, Any],
+        dataframe: pd.DataFrame,
+        x_feature: str,
+        y_feature: str,
+        unique_clusters: List[str],
+        cluster_to_index: Dict[str, int],
+        cmap,
+    ) -> Tuple[bool, Optional[str]]:
+        if ds is None or tf is None:
+            return False, "Datashader not installed; using hexbin rendering."
+        if dataframe.empty:
+            return False, ""
+        try:
+            cluster_series = dataframe["cluster"].astype(str)
+            ds_df = pd.DataFrame(
+                {
+                    x_feature: dataframe[x_feature].to_numpy(dtype=float, copy=False),
+                    y_feature: dataframe[y_feature].to_numpy(dtype=float, copy=False),
+                    "__cluster__": cluster_series.to_numpy(),
+                }
+            )
+            x_min, x_max = float(ds_df[x_feature].min()), float(ds_df[x_feature].max())
+            y_min, y_max = float(ds_df[y_feature].min()), float(ds_df[y_feature].max())
+            if x_min == x_max:
+                delta = abs(x_min) * 0.01 or 1.0
+                x_min -= delta
+                x_max += delta
+            if y_min == y_max:
+                delta = abs(y_min) * 0.01 or 1.0
+                y_min -= delta
+                y_max += delta
+            width, height = self._get_figure_pixels(plot_info["figure"])
+            canvas = ds.Canvas(
+                plot_width=width,
+                plot_height=height,
+                x_range=(x_min, x_max),
+                y_range=(y_min, y_max),
+            )
+            agg = canvas.points(ds_df, x_feature, y_feature, agg=ds.count_cat("__cluster__"))
+            if agg is None:
+                return False, "Datashader produced no aggregates; reverting to hexbin."
+            color_key = {
+                cluster: self._rgba_to_hex(
+                    cmap(
+                        cluster_to_index.get(cluster, 0)
+                        / max(1, len(unique_clusters) - 1)
+                    )
+                )
+                for cluster in unique_clusters
+            }
+            shaded = tf.shade(agg, color_key=color_key, how="eq_hist")
+            image = tf.set_background(shaded, "white").to_pil()
+            ax: Axes = plot_info["ax"]
+            ax.imshow(
+                image,
+                extent=[x_min, x_max, y_min, y_max],
+                origin="lower",
+                aspect="auto",
+                zorder=0,
+            )
+            return True, None
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            return False, f"Datashader rendering failed: {exc}"
+
+    def _render_cluster_explorer_hexbin(
+        self,
+        plot_info: Dict[str, Any],
+        dataframe: pd.DataFrame,
+        x_feature: str,
+        y_feature: str,
+        cluster_codes: np.ndarray,
+        cmap,
+        vmax: float,
+    ) -> None:
+        if dataframe.empty:
+            return
+
+        def _dominant_cluster(values: np.ndarray) -> float:
+            indices = np.array(values, dtype=int)
+            if indices.size == 0:
+                return float("nan")
+            counts = np.bincount(indices)
+            return float(np.argmax(counts))
+
+        ax: Axes = plot_info["ax"]
+        ax.hexbin(
+            dataframe[x_feature],
+            dataframe[y_feature],
+            C=cluster_codes,
+            reduce_C_function=_dominant_cluster,
+            gridsize=60,
+            cmap=cmap,
+            mincnt=1,
+            vmin=0,
+            vmax=vmax,
+        )
+
+    def _ensure_cluster_explorer_lasso(self, plot_info: Dict[str, Any]) -> None:
+        ax: Optional[Axes] = plot_info.get("ax")
+        if ax is None or LassoSelector is None:
+            return
+
+        plot_info["lasso"] = LassoSelector(
+            ax,
+            onselect=lambda verts: self._on_cluster_explorer_lasso(plot_info, verts),
+        )
+
+    def _restore_cluster_explorer_selection_for_plot(
+        self, plot_info: Dict[str, Any]
+    ) -> None:
+        selection = self.cluster_explorer_active_selection
+        if not selection or selection.get("mode") != "lasso":
+            self._update_plot_highlight(plot_info, None)
+            return
+        selected_ids = selection.get("selected_row_ids")
+        if selected_ids is None:
+            self._update_plot_highlight(plot_info, None)
+            return
+        self._update_plot_highlight(plot_info, selected_ids)
 
     def _refresh_cluster_explorer_controls(self) -> None:
         if not hasattr(self, "cluster_explorer_method_combo"):
@@ -2729,6 +3335,7 @@ class FlowDataApp:
             self.cluster_explorer_status_var.set(
                 "Run clustering to explore clusters in this view."
             )
+            self._reset_cluster_explorer_selections()
             if self.cluster_explorer_cluster_listbox is not None:
                 self.cluster_explorer_cluster_listbox.delete(0, tk.END)
             if self.cluster_explorer_select_all_button is not None:
@@ -2754,6 +3361,7 @@ class FlowDataApp:
             self.cluster_explorer_status_var.set(
                 "Selected clustering result is empty."
             )
+            self._reset_cluster_explorer_selections()
         else:
             feature_options = [
                 feature
@@ -2975,6 +3583,7 @@ class FlowDataApp:
         return "break"
 
     def _randomize_cluster_explorer_features(self) -> None:
+        self._reset_cluster_explorer_selections()
         dataset, _ = self._get_cluster_explorer_dataset()
         if dataset is None or dataset.empty:
             for plot in self.cluster_explorer_plots:
@@ -3030,6 +3639,7 @@ class FlowDataApp:
             )
 
         listbox.selection_set(0, tk.END)
+        self._reset_cluster_explorer_selections()
         self._update_all_cluster_explorer_plots()
 
     def _update_all_cluster_explorer_plots(self) -> None:
@@ -3145,6 +3755,8 @@ class FlowDataApp:
     def _update_cluster_explorer_plot(self, plot_info: Dict[str, Any]) -> None:
         ax: Axes = plot_info["ax"]  # type: ignore[assignment]
         canvas: FigureCanvasTkAgg = plot_info["canvas"]  # type: ignore[name-defined]
+        self._disconnect_plot_interactions(plot_info)
+
         dataset, _method_key = self._get_cluster_explorer_dataset()
         x_feature = plot_info.get("x_feature")
         y_feature = plot_info.get("y_feature")
@@ -3154,6 +3766,9 @@ class FlowDataApp:
             ax.set_title("Cluster explorer")
             ax.set_xlabel("Feature X")
             ax.set_ylabel("Feature Y")
+            plot_info["current_dataframe"] = None
+            plot_info["current_view_subset"] = None
+            plot_info["row_ids"] = None
             canvas.draw_idle()
             return
 
@@ -3181,38 +3796,101 @@ class FlowDataApp:
             ax.set_title("No data for selected clusters")
             ax.set_xlabel(x_feature)
             ax.set_ylabel(y_feature)
+            plot_info["current_dataframe"] = None
+            plot_info["current_view_subset"] = None
+            plot_info["row_ids"] = None
             canvas.draw_idle()
             return
 
-        if len(df) > self.cluster_explorer_sample_limit:
-            df = df.sample(
+        render_mode = self._resolve_cluster_explorer_render_mode()
+        dense_warning = render_mode == "scatter" and len(df) > CLUSTER_EXPLORER_DENSE_THRESHOLD
+        working_df = df
+        sampled = False
+        if render_mode == "scatter" and len(df) > self.cluster_explorer_sample_limit:
+            working_df = df.sample(
                 n=self.cluster_explorer_sample_limit, random_state=RANDOM_STATE
             )
+            sampled = True
 
         ax.clear()
-        clusters = df["cluster"].astype(str)
+        clusters = working_df["cluster"].astype(str)
         unique_clusters = sorted(pd.unique(clusters))
         cmap = cm.get_cmap("tab20", max(1, len(unique_clusters)))
         cluster_to_index = {cluster: idx for idx, cluster in enumerate(unique_clusters)}
         cluster_codes = np.array([cluster_to_index[c] for c in clusters], dtype=float)
+        x_data = working_df[str(x_feature)].to_numpy(dtype=float, copy=False)
+        y_data = working_df[str(y_feature)].to_numpy(dtype=float, copy=False)
 
-        dot_size = max(1.0, float(self.cluster_explorer_dot_size_var.get()))
-        alpha = max(0.05, min(1.0, float(self.cluster_explorer_alpha_var.get())))
+        plot_info["row_ids"] = working_df.index.to_numpy()
+        plot_info["x_data"] = x_data
+        plot_info["y_data"] = y_data
+        plot_info["cluster_labels"] = clusters.to_numpy()
+        plot_info["current_dataframe"] = working_df
+        plot_info["current_view_subset"] = working_df
 
-        ax.scatter(
-            df[x_feature],
-            df[y_feature],
-            c=cluster_codes,
-            cmap=cmap,
-            s=dot_size,
-            alpha=alpha,
-            linewidths=0,
-            vmin=0,
-            vmax=max(0, len(unique_clusters) - 1),
-        )
+        status_parts: List[str] = [f"Render mode: {render_mode.capitalize()}."]
+        if dense_warning:
+            status_parts.append(
+                "Dense dataset detected; aggregated render modes preserve the full distribution."
+            )
+        message: Optional[str] = None
+
+        if render_mode == "datashader":
+            success, message = self._render_cluster_explorer_with_datashader(
+                plot_info,
+                working_df,
+                str(x_feature),
+                str(y_feature),
+                unique_clusters,
+                cluster_to_index,
+                cmap,
+            )
+            if not success:
+                if message:
+                    status_parts.append(message)
+                self._render_cluster_explorer_hexbin(
+                    plot_info,
+                    working_df,
+                    str(x_feature),
+                    str(y_feature),
+                    cluster_codes,
+                    cmap,
+                    max(0.0, float(len(unique_clusters) - 1)),
+                )
+            else:
+                status_parts.append("Datashader aggregation applied.")
+        elif render_mode == "hexbin":
+            self._render_cluster_explorer_hexbin(
+                plot_info,
+                working_df,
+                str(x_feature),
+                str(y_feature),
+                cluster_codes,
+                cmap,
+                max(0.0, float(len(unique_clusters) - 1)),
+            )
+        else:
+            dot_size = max(1.0, float(self.cluster_explorer_dot_size_var.get()))
+            alpha = max(0.05, min(1.0, float(self.cluster_explorer_alpha_var.get())))
+            ax.scatter(
+                x_data,
+                y_data,
+                c=cluster_codes,
+                cmap=cmap,
+                s=dot_size,
+                alpha=alpha,
+                linewidths=0,
+                vmin=0,
+                vmax=max(0, len(unique_clusters) - 1),
+            )
+
         ax.set_xlabel(f"{x_feature} ▼")
         ax.set_ylabel(f"{y_feature} ▼")
-        ax.set_title(f"{len(df)} cells | {len(unique_clusters)} clusters")
+        ax.set_title(f"{len(working_df)} cells | {len(unique_clusters)} clusters")
+        if x_data.size:
+            ax.set_xlim(x_data.min(), x_data.max())
+        if y_data.size:
+            ax.set_ylim(y_data.min(), y_data.max())
         ax.margins(0.05)
 
         existing_legend = ax.get_legend()
@@ -3242,11 +3920,47 @@ class FlowDataApp:
                 bbox_to_anchor=(1.0, 1.0),
                 loc="upper left",
                 borderaxespad=0.0,
-            fontsize=8,
+                fontsize=8,
             )
             plot_info["figure"].subplots_adjust(left=0.18, right=0.84, top=0.9, bottom=0.22)
         else:
             plot_info["figure"].subplots_adjust(left=0.18, right=0.96, top=0.9, bottom=0.22)
+
+        if sampled:
+            status_parts.append(
+                f"Showing random sample of {len(working_df)} cells (limit {self.cluster_explorer_sample_limit})."
+            )
+        self.cluster_explorer_status_var.set(" ".join(part for part in status_parts if part))
+
+        self._ensure_cluster_explorer_lasso(plot_info)
+        self._register_plot_axis_callbacks(plot_info)
+        self._restore_cluster_explorer_selection_for_plot(plot_info)
+
+        if self.cluster_explorer_active_selection is None:
+            self.cluster_explorer_active_selection = {
+                "mode": "view",
+                "plot": plot_info.get("index"),
+                "df": working_df,
+                "x_feature": x_feature,
+                "y_feature": y_feature,
+                "source": "view",
+            }
+            self.cluster_explorer_active_plot_index = plot_info.get("index")
+            self._refresh_cluster_explorer_selection_table()
+        elif (
+            self.cluster_explorer_active_selection.get("mode") == "view"
+            and self.cluster_explorer_active_plot_index == plot_info.get("index")
+        ):
+            self.cluster_explorer_active_selection = {
+                "mode": "view",
+                "plot": plot_info.get("index"),
+                "df": working_df,
+                "x_feature": x_feature,
+                "y_feature": y_feature,
+                "source": "view",
+            }
+            self._refresh_cluster_explorer_selection_table()
+
         canvas.draw_idle()
 
     def _handle_cluster_explorer_axis_click(
@@ -3266,6 +3980,55 @@ class FlowDataApp:
             self._open_cluster_explorer_feature_picker(plot_index, "x", event)
         elif contains_y:
             self._open_cluster_explorer_feature_picker(plot_index, "y", event)
+
+    def _on_cluster_explorer_lasso(
+        self, plot_info: Dict[str, Any], vertices: List[Tuple[float, float]]
+    ) -> None:
+        dataframe = plot_info.get("current_dataframe")
+        x_feature = plot_info.get("x_feature")
+        y_feature = plot_info.get("y_feature")
+        if (
+            dataframe is None
+            or dataframe.empty
+            or not x_feature
+            or not y_feature
+            or not vertices
+        ):
+            return
+        mask = select_points_within_path(
+            dataframe,
+            str(x_feature),
+            str(y_feature),
+            vertices,
+        )
+        if mask.size == 0 or not np.any(mask):
+            self._clear_cluster_explorer_selection()
+            self.cluster_explorer_status_var.set(
+                "No cells captured by lasso; view reset."
+            )
+            return
+        selected_df = dataframe.loc[mask]
+        row_ids = plot_info.get("row_ids")
+        if row_ids is None:
+            row_ids = dataframe.index.to_numpy()
+        selected_ids = row_ids[mask]
+        self.cluster_explorer_active_selection = {
+            "mode": "lasso",
+            "plot": plot_info.get("index"),
+            "df": selected_df,
+            "x_feature": x_feature,
+            "y_feature": y_feature,
+            "source": "lasso",
+            "selected_row_ids": selected_ids,
+            "timestamp": time.time(),
+        }
+        self.cluster_explorer_active_plot_index = plot_info.get("index")
+        self._refresh_cluster_explorer_selection_table()
+        self._update_cluster_explorer_selection_highlights()
+        unique_clusters = selected_df["cluster"].astype(str).nunique()
+        self.cluster_explorer_status_var.set(
+            f"Lasso captured {len(selected_df)} cells across {unique_clusters} clusters."
+        )
 
     def _open_cluster_explorer_feature_picker(
         self,
@@ -6831,6 +7594,10 @@ class FlowDataApp:
             ax.set_xlabel("Feature X")
             ax.set_ylabel("Feature Y")
             plot["canvas"].draw_idle()
+        self.cluster_explorer_render_mode_var.set("Scatter")
+        if self.cluster_explorer_render_mode_combo is not None:
+            self.cluster_explorer_render_mode_combo.set("Scatter")
+        self._reset_cluster_explorer_selections()
         self.cluster_annotation_method_var.set("")
         self.cluster_annotations = {}
         self.cluster_annotation_recent_terms = defaultdict(set)
