@@ -1,4 +1,5 @@
 import copy
+import math
 import re
 import sys
 import tkinter as tk
@@ -34,6 +35,7 @@ from matplotlib.patches import Polygon, Rectangle
 from pandas.api.types import is_numeric_dtype
 
 from data_engine import DataEngine, DataEngineError
+from model_cards import EnvironmentSnapshot, ModelCardStore, build_model_card
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.cluster import KMeans
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -57,6 +59,7 @@ except ImportError:
     sparse = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
+    from model_cards import ModelCard
     from scipy.sparse import csr_matrix as CSRMatrix  # type: ignore[import]
 else:  # pragma: no cover - runtime fallback when SciPy is unavailable
     CSRMatrix = Any
@@ -357,11 +360,14 @@ class FlowDataApp:
         self.session_dirty = False
         self.run_registry_path = self.cache_dir / "run_registry.json"
         self.run_registry: List[Dict[str, object]] = []
+        self.model_card_store = ModelCardStore(self.cache_dir / "model_cards.json")
         self._pending_training_restore: Optional[Dict[str, object]] = None
         self.quality_tree: Optional[ttk.Treeview] = None
         self.quality_summary_text: Optional[tk.Text] = None
         self.run_registry_tree: Optional[ttk.Treeview] = None
         self.run_detail_text: Optional[tk.Text] = None
+        self.model_card_tree: Optional[ttk.Treeview] = None
+        self.model_card_detail_text: Optional[tk.Text] = None
         self._loading_session = False
 
         self.data_files: List[DataFile] = []
@@ -403,6 +409,7 @@ class FlowDataApp:
         self.trained_model: Optional[object] = None
         self.training_results: Dict[str, object] = {}
         self.csv_chunksize = DEFAULT_CSV_CHUNKSIZE
+        self._latest_training_signature: Optional[str] = None
 
         self.training_model_var = tk.StringVar(value="Random Forest")
         self.n_estimators_var = tk.IntVar(value=300)
@@ -831,6 +838,7 @@ class FlowDataApp:
         self._init_training_visuals_tab(training_notebook)
         self._init_results_tab(training_notebook)
         self._init_run_registry_tab(training_notebook)
+        self._init_model_cards_tab(training_notebook)
 
         # Clustering module with setup/results/visualization
         clustering_tab = ttk.Frame(notebook)
@@ -4392,6 +4400,65 @@ class FlowDataApp:
             command=self._restore_selected_run,
         ).pack(side="left")
 
+    def _init_model_cards_tab(self, notebook: ttk.Notebook) -> None:
+        container = ttk.Frame(notebook)
+        notebook.add(container, text="Model Cards")
+        scroll = ScrollableFrame(container)
+        scroll.pack(fill="both", expand=True)
+        tab = ttk.Frame(scroll.scrollable_frame, padding=12)
+        tab.pack(fill="both", expand=True)
+
+        ttk.Label(
+            tab,
+            text=(
+                "Model cards capture metrics, dataset context, and environment snapshots "
+                "for each training run. Select a card to view the full report or export "
+                "it as JSON."
+            ),
+            wraplength=800,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        columns = ("created", "model", "target", "accuracy")
+        tree = ttk.Treeview(tab, columns=columns, show="headings", height=12)
+        tree.heading("created", text="Created")
+        tree.heading("model", text="Model")
+        tree.heading("target", text="Target")
+        tree.heading("accuracy", text="Accuracy")
+        tree.column("created", width=180, anchor="w")
+        tree.column("model", width=160, anchor="w")
+        tree.column("target", width=160, anchor="w")
+        tree.column("accuracy", width=100, anchor="center")
+        tree.pack(fill="both", expand=True)
+        tree.bind("<<TreeviewSelect>>", lambda _e: self._on_model_card_select())
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.model_card_tree = tree
+
+        detail_frame = ttk.LabelFrame(tab, text="Model Card Detail", padding=8)
+        detail_frame.pack(fill="both", expand=True, pady=(12, 0))
+        detail_text = tk.Text(
+            detail_frame,
+            height=10,
+            wrap="word",
+            state="disabled",
+            background=self.root.cget("background"),
+            relief="flat",
+        )
+        detail_text.pack(fill="both", expand=True)
+        self.model_card_detail_text = detail_text
+
+        button_row = ttk.Frame(detail_frame)
+        button_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(
+            button_row,
+            text="Export Selected Card",
+            command=self._export_selected_model_card,
+        ).pack(side="left")
+
+        self._update_model_card_view()
+
     def _load_run_registry(self) -> None:
         try:
             if self.run_registry_path.exists():
@@ -4470,6 +4537,208 @@ class FlowDataApp:
             messagebox.showerror("Missing run", "Could not find the selected run in the registry.")
             return
         self._restore_run_configuration(record)
+
+    def _update_model_card_view(self) -> None:
+        if not self.model_card_tree:
+            return
+        cards = self.model_card_store.all_cards()
+        tree = self.model_card_tree
+        tree.delete(*tree.get_children())
+        for card in cards:
+            created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(card.created_at))
+            accuracy = card.metrics.summary.get("accuracy")
+            accuracy_str = f"{accuracy:.3f}" if isinstance(accuracy, float) else "-"
+            tree.insert(
+                "",
+                "end",
+                iid=card.id,
+                values=(created, card.model_name, card.dataset.target, accuracy_str),
+            )
+        if self.model_card_detail_text is not None:
+            self.model_card_detail_text.configure(state="normal")
+            self.model_card_detail_text.delete("1.0", tk.END)
+            message = "Select a model card to view details."
+            if not cards:
+                message = "Model cards will appear here after the next successful training run."
+            self.model_card_detail_text.insert("1.0", message)
+            self.model_card_detail_text.configure(state="disabled")
+
+    def _on_model_card_select(self) -> None:
+        if not self.model_card_tree or self.model_card_detail_text is None:
+            return
+        selection = self.model_card_tree.selection()
+        if not selection:
+            return
+        card = self.model_card_store.get_card(selection[0])
+        if card is None:
+            return
+        detail = self._format_model_card_text(card)
+        self.model_card_detail_text.configure(state="normal")
+        self.model_card_detail_text.delete("1.0", tk.END)
+        self.model_card_detail_text.insert("1.0", detail)
+        self.model_card_detail_text.configure(state="disabled")
+
+    def _export_selected_model_card(self) -> None:
+        if not self.model_card_tree:
+            return
+        selection = self.model_card_tree.selection()
+        if not selection:
+            messagebox.showinfo("Select card", "Select a model card to export.")
+            return
+        card_id = selection[0]
+        destination = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+            title="Export model card",
+        )
+        if not destination:
+            return
+        try:
+            self.model_card_store.export_card(card_id, Path(destination))
+        except KeyError:
+            messagebox.showerror("Export error", "The selected model card no longer exists.")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Export error", f"Failed to export model card: {exc}")
+        else:
+            messagebox.showinfo("Export complete", f"Model card exported to {destination}")
+
+    def _format_model_card_text(self, card: "ModelCard") -> str:
+        created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(card.created_at))
+        lines = [
+            f"Created: {created}",
+            f"Model: {card.model_name}",
+            f"Target: {card.dataset.target}",
+            f"Features: {len(card.dataset.features)} total",
+        ]
+        if card.tags:
+            lines.append(f"Tags: {', '.join(card.tags)}")
+        if card.notes:
+            lines.append(f"Notes: {card.notes}")
+
+        summary_parts = []
+        for key, label in (
+            ("accuracy", "Accuracy"),
+            ("f1_macro", "Macro F1"),
+            ("f1_weighted", "Weighted F1"),
+        ):
+            value = card.metrics.summary.get(key)
+            if isinstance(value, float):
+                summary_parts.append(f"{label}: {value:.3f}")
+        if summary_parts:
+            lines.append("Metrics — " + ", ".join(summary_parts))
+
+        if card.metrics.cv_scores:
+            scores = card.metrics.cv_scores
+            mean = sum(scores) / len(scores)
+            variance = sum((score - mean) ** 2 for score in scores) / len(scores)
+            std = math.sqrt(variance)
+            cv_line = f"CV macro F1: mean {mean:.3f} ± {std:.3f} ({len(scores)} folds)"
+            if card.metrics.cv_warning:
+                cv_line += f" — {card.metrics.cv_warning}"
+            lines.append(cv_line)
+        elif card.metrics.cv_warning:
+            lines.append(f"CV warning: {card.metrics.cv_warning}")
+
+        if card.dataset.train_rows is not None or card.dataset.test_rows is not None:
+            lines.append(
+                "Rows — "
+                + ", ".join(
+                    part
+                    for part in [
+                        f"train={card.dataset.train_rows}" if card.dataset.train_rows is not None else "",
+                        f"test={card.dataset.test_rows}" if card.dataset.test_rows is not None else "",
+                    ]
+                    if part
+                )
+            )
+        if card.dataset.signature:
+            lines.append(f"Dataset signature: {card.dataset.signature}")
+        if card.dataset.class_balance and card.dataset.class_balance.lower() != "none":
+            lines.append(f"Class balance mode: {card.dataset.class_balance}")
+        if card.dataset.downsampling:
+            method = card.dataset.downsampling.get("method")
+            descriptor = f"Downsampling: {method}" if method else "Downsampling applied"
+            value = card.dataset.downsampling.get("value")
+            if value:
+                descriptor += f" (value={value})"
+            message = card.dataset.downsampling.get("message")
+            if message:
+                descriptor += f" — {message}"
+            lines.append(descriptor)
+        if card.dataset.class_distribution:
+            distribution = ", ".join(
+                f"{label}: {count}"
+                for label, count in sorted(card.dataset.class_distribution.items())
+            )
+            lines.append(f"Class distribution: {distribution}")
+        if card.dataset.class_names:
+            lines.append(f"Classes: {', '.join(card.dataset.class_names)}")
+        if card.dataset.features:
+            preview = ", ".join(card.dataset.features[:20])
+            if len(card.dataset.features) > 20:
+                preview += ", …"
+            lines.append(f"Feature preview: {preview}")
+        if card.dataset.sources:
+            display_paths = card.dataset.sources[:5]
+            path_preview = ", ".join(display_paths)
+            if len(card.dataset.sources) > 5:
+                path_preview += ", …"
+            lines.append(f"Sources: {path_preview}")
+
+        if card.metrics.per_class:
+            lines.append("Per-class metrics:")
+            for label, metrics in sorted(card.metrics.per_class.items()):
+                metric_str = ", ".join(
+                    f"{name}={value:.3f}" for name, value in metrics.items()
+                )
+                lines.append(f"  {label}: {metric_str}")
+
+        env = card.environment
+        env_line = f"Environment — Python {env.python_version} on {env.platform}"
+        if env.libraries:
+            libs = ", ".join(
+                f"{name}={version}" for name, version in sorted(env.libraries.items())
+            )
+            env_line += f"; Libraries: {libs}"
+        lines.append(env_line)
+
+        if card.artifacts:
+            artifact_keys = ", ".join(sorted(card.artifacts.keys()))
+            lines.append(f"Artifacts captured: {artifact_keys}")
+
+        return "\n".join(lines)
+
+    def _save_model_card(self, payload: Dict[str, object]) -> None:
+        class_balance_value = self.class_balance_var.get().strip()
+        class_balance = (
+            class_balance_value if class_balance_value and class_balance_value != "None" else None
+        )
+        try:
+            card = build_model_card(
+                model_name=str(payload.get("model_name", self.training_model_var.get())),
+                payload=payload,
+                features=payload.get("features", self.training_selection),
+                target=str(payload.get("target", self.target_column_var.get())),
+                dataset_sources=[str(data_file.path) for data_file in self.data_files],
+                dataset_signature=self._latest_training_signature,
+                class_balance=class_balance,
+                tags=self._parse_tags(self.run_tags_var.get()),
+                notes=self.run_notes_var.get().strip(),
+                downsampling=self._current_downsampling_summary(),
+                training_config=payload.get("config", {}),
+                environment_snapshot=EnvironmentSnapshot.capture(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"Failed to build model card: {exc}")
+            return
+        self.model_card_store.add_card(card)
+        self._update_model_card_view()
+
+    def get_model_cards(self) -> List[Dict[str, object]]:
+        return [card.to_dict() for card in self.model_card_store.all_cards()]
+
+    def export_model_card(self, card_id: str, destination: Path) -> Path:
+        return self.model_card_store.export_card(card_id, destination)
 
     def _find_run_record(self, run_id: str) -> Optional[Dict[str, object]]:
         for record in self.run_registry:
@@ -6685,11 +6954,25 @@ class FlowDataApp:
             columns=required_columns,
             extra={"mode": "training"},
         )
+        self._latest_training_signature = signature
         cache_path = self.data_engine.ensure_cached_dataset(
             signature=signature,
             columns=required_columns,
         )
         return pd.read_parquet(cache_path)
+
+    def _current_downsampling_summary(self) -> Optional[Dict[str, object]]:
+        method = self.training_downsample_method_var.get()
+        if not method or method == "None":
+            return None
+        summary: Dict[str, object] = {"method": method}
+        value = self.training_downsample_value_var.get().strip()
+        if value:
+            summary["value"] = value
+        message = self.training_downsample_message_var.get().strip()
+        if message and "Configure" not in message:
+            summary["message"] = message
+        return summary
 
     @staticmethod
     def _compute_class_weight_dict(y: pd.Series) -> Dict[object, float]:
@@ -7883,6 +8166,7 @@ class FlowDataApp:
         self._update_confusion_matrix_plot(payload)
         self._update_importance_plot(payload)
         self.save_model_button.configure(state="normal")
+        self._save_model_card(payload)
         self._record_training_run(payload)
 
     def _handle_training_failure(self, message: str) -> None:
