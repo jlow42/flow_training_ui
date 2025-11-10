@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from functools import partial
 from threading import Thread
-from typing import Any, Dict, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING
 
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
@@ -51,7 +51,15 @@ from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.pipeline import Pipeline
-from scipy import sparse
+try:
+    from scipy import sparse  # type: ignore[import]
+except ImportError:
+    sparse = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from scipy.sparse import csr_matrix as CSRMatrix  # type: ignore[import]
+else:  # pragma: no cover - runtime fallback when SciPy is unavailable
+    CSRMatrix = Any
 
 try:
     import igraph as ig  # type: ignore[import]
@@ -6094,7 +6102,9 @@ class FlowDataApp:
 
     def _build_knn_graph(
         self, X: np.ndarray, n_neighbors: int, n_jobs: int
-    ) -> sparse.csr_matrix:
+    ) -> CSRMatrix:
+        if sparse is None:
+            raise ImportError("scipy")
         n_neighbors = min(max(2, n_neighbors), max(2, X.shape[0] - 1))
         nbrs = NearestNeighbors(
             n_neighbors=n_neighbors + 1,
@@ -6108,7 +6118,7 @@ class FlowDataApp:
         graph.eliminate_zeros()
         return graph
 
-    def _igraph_from_sparse(self, matrix: sparse.csr_matrix) -> "ig.Graph":
+    def _igraph_from_sparse(self, matrix: CSRMatrix) -> "ig.Graph":
         if ig is None:
             raise ImportError("python-igraph")
         coo = matrix.tocoo()
