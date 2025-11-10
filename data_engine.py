@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence
 
@@ -13,29 +16,90 @@ except ImportError:  # pragma: no cover
     duckdb = None  # type: ignore
     DUCKDB_AVAILABLE = False
 
+try:  # pragma: no cover - import guard for optional polars support
+    import polars as pl
+    POLARS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    pl = None  # type: ignore
+    POLARS_AVAILABLE = False
+
+try:  # pragma: no cover - pyarrow is optional but recommended for chunking
+    import pyarrow.dataset as pa_dataset
+    PYARROW_DATASET_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    pa_dataset = None  # type: ignore
+    PYARROW_DATASET_AVAILABLE = False
+
 import numpy as np
 import pandas as pd
+
+
+DEFAULT_CACHE_CHUNK_SIZE = 200_000
+CACHE_MANIFEST_SUFFIX = ".json"
+CACHE_VERSION = 1
 
 
 class DataEngineError(RuntimeError):
     """Raised when the data engine encounters a critical issue."""
 
 
-class DataEngine:
-    """Minimal helper that routes multi-file CSV queries through DuckDB.
+def _env_flag(value: Optional[str], default: bool = True) -> bool:
+    """Interpret an environment variable flag."""
 
-    This lets the application combine arbitrarily large CSV collections without
-    keeping every row in memory and provides a shared cache for expensive
-    combinations (e.g., training feature sets).
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class DataEngineConfig:
+    """Configuration flags controlling backend and caching behaviour."""
+
+    enable_duckdb: bool = True
+    enable_polars: bool = True
+    spill_to_disk: bool = True
+    cache_compression: str = "zstd"
+    default_chunk_size: int = DEFAULT_CACHE_CHUNK_SIZE
+
+    @classmethod
+    def from_env(cls) -> "DataEngineConfig":
+        """Initialise configuration from environment variables."""
+
+        chunk_size_env = os.environ.get(
+            "FLOW_ENGINE_DEFAULT_CHUNK_SIZE", str(DEFAULT_CACHE_CHUNK_SIZE)
+        )
+        try:
+            chunk_size = int(chunk_size_env)
+        except (TypeError, ValueError):
+            chunk_size = DEFAULT_CACHE_CHUNK_SIZE
+
+        return cls(
+            enable_duckdb=_env_flag(os.environ.get("FLOW_ENGINE_ENABLE_DUCKDB"), True),
+            enable_polars=_env_flag(os.environ.get("FLOW_ENGINE_ENABLE_POLARS"), True),
+            spill_to_disk=_env_flag(os.environ.get("FLOW_ENGINE_SPILL_TO_DISK"), True),
+            cache_compression=os.environ.get("FLOW_ENGINE_CACHE_COMPRESSION", "zstd"),
+            default_chunk_size=chunk_size,
+        )
+
+
+class DataEngine:
+    """Helper that routes multi-file CSV queries through DuckDB/Polars backends.
+
+    The engine combines arbitrarily large CSV collections without keeping every
+    row in memory. DuckDB powers SQL querying while Polars and PyArrow provide a
+    lazy interface and chunked/batched materialisation. A spill-to-disk parquet
+    cache enables reuse across sessions.
     """
 
-    def __init__(self, cache_dir: Path) -> None:
+    def __init__(self, cache_dir: Path, config: Optional[DataEngineConfig] = None) -> None:
+        self.config = config or DataEngineConfig.from_env()
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.prepared_dir = self.cache_dir / "prepared"
         self.prepared_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.cache_dir / "engine.duckdb"
-        self._duckdb_available = DUCKDB_AVAILABLE
+        self._duckdb_available = DUCKDB_AVAILABLE and self.config.enable_duckdb
+        self._polars_available = POLARS_AVAILABLE and self.config.enable_polars
         self.conn = duckdb.connect(str(self.db_path)) if self._duckdb_available else None
         self.file_views: Dict[str, Dict[str, object]] = {}
 
@@ -103,18 +167,37 @@ class DataEngine:
     def ensure_cached_dataset(
         self,
         signature: str,
-        columns: Sequence[str],
+        columns: Optional[Sequence[str]] = None,
         filters: Optional[str] = None,
     ) -> Path:
+        if not self.config.spill_to_disk:
+            raise DataEngineError(
+                "Spill-to-disk caching is disabled via configuration; enable it to create reusable datasets."
+            )
+
+        requested_columns = list(columns) if columns else self._all_columns()
+        if "__source_file" not in requested_columns:
+            requested_columns.append("__source_file")
         cache_path = self.prepared_dir / f"prepared_{signature}.parquet"
-        if cache_path.exists():
+        manifest_path = self._cache_manifest_path(cache_path)
+        if cache_path.exists() and manifest_path.exists():
             return cache_path
+
         if not self._duckdb_available or self.conn is None:
-            df = self._fallback_fetch_dataframe(columns, filters)
+            df = self._fallback_fetch_dataframe(requested_columns, filters)
             df.to_parquet(cache_path, index=False)
-            return cache_path
-        relation = self._build_union_relation(columns, filters)
-        relation.write_parquet(str(cache_path), compression="zstd")
+        else:
+            relation = self._build_union_relation(requested_columns, filters)
+            relation.write_parquet(
+                str(cache_path), compression=self.config.cache_compression
+            )
+
+        self._write_cache_manifest(
+            cache_path,
+            signature,
+            requested_columns,
+            filters,
+        )
         return cache_path
 
     def column_stats(self, column: str, numeric: bool) -> Dict[str, object]:
@@ -187,12 +270,15 @@ class DataEngine:
 
     def build_signature(
         self,
-        columns: Sequence[str],
+        columns: Optional[Sequence[str]] = None,
         filters: Optional[str] = None,
         extra: Optional[Dict[str, object]] = None,
     ) -> str:
+        requested_columns = list(columns) if columns else self._all_columns()
+        if "__source_file" not in requested_columns:
+            requested_columns.append("__source_file")
         payload = {
-            "columns": list(columns),
+            "columns": requested_columns,
             "filters": filters or "",
             "files": [
                 {
@@ -205,6 +291,73 @@ class DataEngine:
         }
         blob = json.dumps(payload, sort_keys=True).encode()
         return hashlib.sha1(blob).hexdigest()
+
+    def load_lazy_dataset(
+        self,
+        columns: Optional[Sequence[str]] = None,
+        filters: Optional[str] = None,
+        use_cache: bool = True,
+    ) -> "pl.LazyFrame":
+        if not self._polars_available:
+            raise DataEngineError(
+                "Polars support is disabled or unavailable; enable it to request lazy datasets."
+            )
+
+        if not use_cache:
+            raise DataEngineError(
+                "Lazy datasets require the spill-to-disk cache; call with use_cache=True."
+            )
+
+        signature = self.build_signature(columns, filters, extra={"cache_version": CACHE_VERSION})
+        cache_path = self.ensure_cached_dataset(signature, columns, filters)
+        return pl.scan_parquet(str(cache_path))
+
+    def iter_batches(
+        self,
+        columns: Optional[Sequence[str]] = None,
+        filters: Optional[str] = None,
+        batch_size: Optional[int] = None,
+        use_cache: bool = True,
+    ) -> Iterator[pd.DataFrame]:
+        if batch_size is None:
+            batch_size = self.config.default_chunk_size
+
+        if batch_size <= 0:
+            raise DataEngineError("batch_size must be a positive integer")
+
+        requested_columns = list(columns) if columns else None
+
+        if use_cache and self.config.spill_to_disk:
+            signature = self.build_signature(
+                requested_columns, filters, extra={"cache_version": CACHE_VERSION}
+            )
+            cache_path = self.ensure_cached_dataset(signature, requested_columns, filters)
+            yield from self._iter_batches_from_cache(cache_path, batch_size)
+            return
+
+        if not self._duckdb_available or self.conn is None:
+            yield from self._fallback_iter_batches(requested_columns, batch_size)
+            return
+
+        offset = 0
+        while True:
+            base_sql = self._build_union_sql(requested_columns, filters)
+            limit_clause = f" LIMIT {int(batch_size)} OFFSET {int(offset)}"
+            chunk_relation = self.conn.sql(
+                f"SELECT * FROM ({base_sql}) AS unioned{limit_clause}"
+            )
+            chunk_df = chunk_relation.df()
+            if chunk_df.empty:
+                break
+            yield chunk_df
+            offset += len(chunk_df)
+
+    def get_cached_dataset_metadata(self, cache_path: Path) -> Optional[Dict[str, object]]:
+        manifest_path = self._cache_manifest_path(cache_path)
+        if not manifest_path.exists():
+            return None
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
 
     def _build_union_relation(
         self,
@@ -347,3 +500,89 @@ class DataEngine:
                 continue
             series = pd.read_csv(path, usecols=[column], low_memory=False)[column]
             yield series
+
+    def _iter_batches_from_cache(
+        self, cache_path: Path, batch_size: int
+    ) -> Iterator[pd.DataFrame]:
+        if self._duckdb_available and self.conn is not None:
+            offset = 0
+            escaped = cache_path.as_posix().replace("'", "''")
+            while True:
+                sql = (
+                    f"SELECT * FROM read_parquet('{escaped}')"
+                    f" LIMIT {int(batch_size)} OFFSET {int(offset)}"
+                )
+                df = self.conn.sql(sql).df()
+                if df.empty:
+                    break
+                yield df
+                offset += len(df)
+            return
+
+        if PYARROW_DATASET_AVAILABLE:
+            dataset = pa_dataset.dataset(str(cache_path))
+            for batch in dataset.to_batches(batch_size=batch_size):
+                yield batch.to_pandas()
+            return
+
+        df = pd.read_parquet(cache_path)
+        for start in range(0, len(df), batch_size):
+            yield df.iloc[start : start + batch_size].copy()
+
+    def _fallback_iter_batches(
+        self, columns: Optional[Sequence[str]], batch_size: int
+    ) -> Iterator[pd.DataFrame]:
+        if batch_size <= 0:
+            raise DataEngineError("batch_size must be a positive integer")
+
+        requested_columns = list(columns) if columns else self._all_columns()
+        if "__source_file" not in requested_columns:
+            requested_columns.append("__source_file")
+
+        for info in self.file_views.values():
+            path = Path(info["path"])
+            usecols = [col for col in requested_columns if col != "__source_file"] or None
+            try:
+                iterator = pd.read_csv(
+                    path,
+                    usecols=usecols,
+                    low_memory=False,
+                    chunksize=batch_size,
+                )
+            except ValueError as exc:
+                raise DataEngineError(str(exc)) from exc
+            for chunk in iterator:
+                chunk["__source_file"] = path.name
+                for column in requested_columns:
+                    if column not in chunk.columns:
+                        chunk[column] = pd.NA
+                chunk = chunk[requested_columns]
+                yield chunk
+
+    def _cache_manifest_path(self, cache_path: Path) -> Path:
+        return cache_path.with_suffix(cache_path.suffix + CACHE_MANIFEST_SUFFIX)
+
+    def _write_cache_manifest(
+        self,
+        cache_path: Path,
+        signature: str,
+        columns: Sequence[str],
+        filters: Optional[str],
+    ) -> None:
+        manifest_path = self._cache_manifest_path(cache_path)
+        manifest = {
+            "signature": signature,
+            "columns": list(columns),
+            "filters": filters or "",
+            "cache_version": CACHE_VERSION,
+            "created_at": time.time(),
+            "files": [
+                {
+                    "path": info["path"],
+                    "mtime": info.get("mtime", 0.0),
+                }
+                for info in sorted(self.file_views.values(), key=lambda item: item["path"])
+            ],
+        }
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, sort_keys=True)
